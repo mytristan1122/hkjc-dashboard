@@ -8,7 +8,7 @@ from datetime import datetime, date, timezone, timedelta
 from collections import defaultdict, deque
 from streamlit_autorefresh import st_autorefresh
 
-APP_VERSION = "v13.6 STHV"
+APP_VERSION = "v13.8 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -281,9 +281,16 @@ def pools_to_df(pools):
     for p in pools:
         pool_type = p.get("oddsType")
         for n in p.get("oddsNodes", []):
+            odds = _to_float(n.get("oddsValue"))
+            # Skip scratched / withdrawn runners: HKJC returns them with a
+            # non-numeric or 0 oddsValue (e.g. "SCR", "---", "0"). A runner
+            # still in the race always has a positive win/place odds once the
+            # pool is selling, so odds <= 0 means it should not be shown.
+            if odds <= 0:
+                continue
             rows.append({"池": pool_type,
                          "馬號": n.get("combString"),
-                         "賠率": _to_float(n.get("oddsValue")),
+                         "賠率": odds,
                          "大熱": bool(n.get("hotFavourite"))})
     return pd.DataFrame(rows)
 
@@ -656,12 +663,14 @@ def moneyflow_panel(df_pool, pool_name, pool_inv=None, S=None, mtp=None, other_p
     """Method A money flow + visual surge detection.
     Adds: stake bar, ▲/🔥 surge highlight, surge-first sorting, 近30秒流入$.
     'Surge' is detected purely by $ inflow in the last 30s (Method A, no time gate)."""
-    sub = df_pool[(df_pool["即場"] > 0) & (df_pool["開賠"] > 0)].copy()
+    sub = df_pool[df_pool["即場"] > 0].copy()
     if sub.empty:
         st.markdown(
             f'<div class="panel"><div class="panel-title">💰 {pool_name}資金流向</div>'
             f'<div class="panel-sub">暫無資料</div></div>', unsafe_allow_html=True)
         return
+    # open-odds fallback: if 開賠 somehow 0/missing, use live so the horse still shows
+    sub["開賠"] = sub.apply(lambda r: r["開賠"] if r["開賠"] > 0 else r["即場"], axis=1)
 
     # pool_name is the display name (獨贏/位置); the series is keyed by the
     # pool CODE (WIN/PLA) held in the 池 column. Use the code for lookups.
