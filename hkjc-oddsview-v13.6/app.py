@@ -7,12 +7,70 @@ import numpy as np
 from datetime import datetime, date, timezone, timedelta
 from collections import defaultdict, deque
 from streamlit_autorefresh import st_autorefresh
+import os
+import json
+import glob
 
-APP_VERSION = "v13.8 STHV"
+APP_VERSION = "v15.5 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
                    initial_sidebar_state="collapsed")
+
+# ════════════════════════════════════════════════════════════
+#  DISK STORAGE (永久儲存 — 寫落硬碟，重啟唔失)
+# ════════════════════════════════════════════════════════════
+# 每場一個資料夾，每個時間點一個 JSON snapshot（每 30 秒一次）。
+DATA_DIR = os.environ.get("HKJC_DATA_DIR", os.path.join(os.path.expanduser("~"), "hkjc_data"))
+SNAPSHOT_INTERVAL = 30  # 秒，每隔幾耐存一個 snapshot
+
+def _race_dir(race_key):
+    # encode | as __ and keep the rest; date dashes stay as-is (reversible)
+    safe = race_key.replace("|", "__")
+    return os.path.join(DATA_DIR, safe)
+
+def save_snapshot(race_key, snapshot):
+    """Write one timepoint snapshot to disk as JSON. snapshot is a dict."""
+    try:
+        rd = _race_dir(race_key)
+        os.makedirs(rd, exist_ok=True)
+        ts = snapshot.get("ts", datetime.now().timestamp())
+        fn = os.path.join(rd, f"{int(ts)}.json")
+        with open(fn, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+def list_saved_races():
+    """Return list of race_key strings that have saved snapshots on disk."""
+    try:
+        if not os.path.isdir(DATA_DIR):
+            return []
+        out = []
+        for d in os.listdir(DATA_DIR):
+            full = os.path.join(DATA_DIR, d)
+            if os.path.isdir(full) and glob.glob(os.path.join(full, "*.json")):
+                out.append(d.replace("__", "|"))
+        return sorted(out)
+    except Exception:
+        return []
+
+def load_snapshots(race_key):
+    """Load all snapshots for a race, sorted by ts. Returns list of dicts."""
+    try:
+        rd = _race_dir(race_key)
+        files = sorted(glob.glob(os.path.join(rd, "*.json")), key=lambda p: int(os.path.basename(p)[:-5]))
+        snaps = []
+        for fn in files:
+            try:
+                with open(fn, encoding="utf-8") as f:
+                    snaps.append(json.load(f))
+            except Exception:
+                continue
+        return snaps
+    except Exception:
+        return []
 
 # ════════════════════════════════════════════════════════════
 #  CONFIG / CONSTANTS
@@ -40,6 +98,16 @@ AXIS_MINUTES = 14          # countdown axis spans -14min -> 0 (post)
 SURGE_WINDOW = 30          # 近 N 秒
 SURGE_MIN_DROP = 4.0       # 近30秒賠率跌幅 >= 此 % -> ▲ 急跌（有錢入）
 SURGE_BIG_DROP = 8.0       # 近30秒賠率跌幅 >= 此 % -> 🔥 大量湧入
+
+# ── 四池熱度 1分鐘佔比升幅 分層門檻（拉桿可調）──
+RISE_TIER1 = 0.5   # ⚡ 留意
+RISE_TIER2 = 0.8   # 🔥 明顯
+RISE_TIER3 = 1.2   # 💥 強烈
+
+# ── 棒型圖 + 每分鐘金額表 統一「實質金額」門檻（另一組拉桿）──
+MONEY_TIER1 = 100_000   # ⚡ 留意（$）
+MONEY_TIER2 = 200_000   # 🔥 明顯（$）
+MONEY_TIER3 = 400_000   # 💥 強烈（$）
 
 # ── 綜合評分（100 分制）配置 ──
 # 各項滿分：資金急升 40 + 賠率急跌 30 + 水位成熟 20 + 獨位一致 10 = 100
@@ -105,6 +173,18 @@ st.markdown("""
 }
 html, body, .stApp { background:var(--bg)!important; color:var(--text); font-family:'Inter',sans-serif; }
 #MainMenu, footer, header { visibility:hidden; }
+
+/* ── 減少每 5 秒更新時嘅閃動（又暗又光）── */
+/* 1. 固定背景，refresh 時唔會閃白 */
+.stApp, .main, .block-container { background:var(--bg)!important; }
+/* 2. 停用 Streamlit 每次 rerun 嘅淡入動畫（就係「又暗又光」主因） */
+.stApp [data-testid="stAppViewContainer"] * { animation:none!important; }
+.element-container, .stMarkdown { transition:none!important; animation:none!important; }
+[data-testid="stAppViewBlockContainer"] { opacity:1!important; }
+/* 3. 更新時嘅「running」半透明遮罩，令佢唔會令全頁變暗 */
+[data-testid="stStatusWidget"] { display:none!important; }
+.stApp > div[data-stale="true"] { opacity:1!important; filter:none!important; }
+[data-stale="true"] { opacity:1!important; }
 .block-container { padding:0.8rem 1.6rem 2rem!important; max-width:100%!important; }
 .hdr { display:flex; align-items:center; justify-content:space-between; padding:10px 16px;
   background:var(--surface); border:1px solid var(--border); border-radius:10px; margin-bottom:10px; }
@@ -186,6 +266,7 @@ def _blank_state():
         "series": defaultdict(lambda: deque(maxlen=400)),  # (pool,horse)->[(x_min, odds)]
         "stake_hist": defaultdict(lambda: deque(maxlen=400)),  # (pool,horse)->[(ts_epoch, stake$)]
         "ever_surged": {},    # (pool,horse) -> peak drop% ever seen (for 🔥 memory)
+        "share_hist": defaultdict(lambda: deque(maxlen=400)),  # (pool,horse)->[(ts,share%)]
         "post_time": None,    # datetime in HKT
         "started_at": None,   # when monitoring began
     }
@@ -255,13 +336,94 @@ def fetch_turnover(date_str, course):
                 out.setdefault(int(rno), {})["post"] = pt
         for p in (m.get("poolInvs") or []):
             otype = p.get("oddsType")
-            if otype not in ("WIN", "PLA"):
+            if otype not in ("WIN", "PLA", "QIN", "QPL"):
                 continue
             inv = _to_float(p.get("investment"))
             races = (p.get("leg") or {}).get("races") or []
             for rno in races:
                 out.setdefault(int(rno), {})[otype] = inv
     return out
+
+def fetch_combo(date_str, course, race_no):
+    """Fetch QIN (連贏) + QPL (位置Q) odds. Same verbatim query, only the
+    oddsTypes VARIABLE changes (query string unchanged -> no whitelist risk).
+    Returns the raw pmPools list for combination pools."""
+    payload = {"operationName": "racing",
+               "variables": {"date": date_str, "venueCode": course,
+                             "raceNo": race_no, "oddsTypes": ["QIN", "QPL"]},
+               "query": RACING_QUERY}
+    try:
+        r = requests.post(API, headers=HEADERS, json=payload, timeout=20)
+        j = r.json()
+        if isinstance(j, dict) and j.get("errors"):
+            return []
+        meetings = j.get("data", {}).get("raceMeetings", []) or []
+        for m in meetings:
+            if m.get("pmPools"):
+                return m["pmPools"]
+    except Exception:
+        return []
+    return []
+
+def combo_to_matrix(pools, pool_type):
+    """Parse a combination pool (QIN/QPL) into {(a,b): odds} with a<b (ints),
+    plus a per-horse participation sum {horse: total 1/odds across its pairs}.
+    combString for pairs looks like '3,7' or '3-7'."""
+    matrix = {}
+    for p in pools:
+        if p.get("oddsType") != pool_type:
+            continue
+        for n in p.get("oddsNodes", []):
+            comb = n.get("combString") or ""
+            odds = _to_float(n.get("oddsValue"))
+            if odds <= 0:
+                continue
+            parts = comb.replace("-", ",").split(",")
+            if len(parts) != 2:
+                continue
+            try:
+                a, b = int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+            if a > b:
+                a, b = b, a
+            matrix[(a, b)] = odds
+    return matrix
+
+def combo_participation(matrix):
+    """Per-horse participation in a combo pool = sum of 1/odds over all pairs
+    containing that horse. Higher = more money concentrated on that horse's
+    combinations. Returns {horse:int -> share% within pool}."""
+    raw = {}
+    for (a, b), odds in matrix.items():
+        if odds <= 0:
+            continue
+        inv = 1.0 / odds
+        raw[a] = raw.get(a, 0.0) + inv
+        raw[b] = raw.get(b, 0.0) + inv
+    total = sum(raw.values())
+    if total <= 0:
+        return {}
+    return {h: v / total * 100.0 for h, v in raw.items()}
+
+def record_share(S, pool, horse, share_pct):
+    """Record a horse's pool share% at current time for rise detection."""
+    S["share_hist"][(pool, str(horse))].append((datetime.now(HKT).timestamp(), share_pct))
+
+def share_rise(S, pool, horse, seconds=60):
+    """% points the horse's share rose over the last N seconds (default 1 min)."""
+    hist = S["share_hist"][(pool, str(horse))]
+    if len(hist) < 2:
+        return 0.0
+    last_ts, last_v = hist[-1]
+    cutoff = last_ts - seconds
+    base_v = None
+    for ts, v in hist:
+        if ts <= cutoff:
+            base_v = v
+    if base_v is None:
+        base_v = hist[0][1]
+    return last_v - base_v   # positive = share grew
 
 def parse_post_time(pt_str):
     """HKJC postTime is ISO-ish, e.g. '2026-06-10T14:46:00+08:00'."""
@@ -946,6 +1108,340 @@ def stake_bar_chart(df_pool, pool_name, pool_inv, S):
     )
     st.markdown(html, unsafe_allow_html=True)
 
+def stake_bar_chart_v(df_pool, pool_name, pool_inv, S, sort_by="馬號",
+                      m1=100_000, m2=200_000, m3=400_000):
+    """Vertical bar chart (volume-bar style): each horse a bar rising from the
+    bottom; height = stake ($). Signal by 1-min actual inflow $ (money tiers,
+    synced with the minute table). sort_by: '馬號' or '賠率'."""
+    if pool_inv is None or pool_inv <= 0:
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">📊 {pool_name}投注額棒型圖</div>'
+            f'<div class="panel-sub">暫無彩池金額</div></div>', unsafe_allow_html=True)
+        return
+    sub = df_pool[df_pool["即場"] > 0].copy()
+    if sub.empty:
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">📊 {pool_name}投注額棒型圖</div>'
+            f'<div class="panel-sub">有彩池金額 {_fmt_money(pool_inv)}，但未有逐匹馬賠率 — '
+            f'開賣初期或該池賠率未更新，有賠率就會自動出棒</div></div>', unsafe_allow_html=True)
+        return
+    pool_code = str(df_pool["池"].iloc[0]) if len(df_pool) else pool_name
+    inv_live = 1.0 / sub["即場"]
+    sub["投注額"] = inv_live / inv_live.sum() * pool_inv
+    if sort_by == "賠率":
+        sub = sub.sort_values("即場")  # hot -> cold
+    else:
+        sub = sub.sort_values("馬號", key=lambda s: pd.to_numeric(s, errors="coerce"))
+    max_stake = sub["投注額"].max() if len(sub) else 1
+
+    bars = ""
+    for _, r in sub.iterrows():
+        horse = r["馬號"]
+        odds = r["即場"]
+        stake = r["投注額"]
+        # signal = actual $ inflow in last 60s (money tiers) — synced w/ minute table
+        inflow = recent_stake_gain(S, pool_code, horse, 60) if S is not None else 0.0
+        if inflow >= m3:
+            bcol = "#c878ff"       # 💥 強烈
+        elif inflow >= m2:
+            bcol = "#ff8c3c"       # 🔥 明顯
+        elif inflow >= m1:
+            bcol = "#ffd43b"       # ⚡ 留意
+        else:
+            bcol = INFO
+        h_px = max(4, int(stake / max_stake * 120)) if max_stake > 0 else 4
+        inflow_lbl = (f'<div style="font-size:8px;color:{bcol};height:12px;text-align:center;white-space:nowrap">'
+                      f'{("+"+_fmt_money(inflow)) if inflow>=m1 else ""}</div>')
+        bars += (
+            f'<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;min-width:0">'
+            f'{inflow_lbl}'
+            f'<div style="width:70%;height:{h_px}px;background:{bcol};border-radius:3px 3px 0 0;'
+            f'opacity:0.9"></div>'
+            f'<div style="font-size:10px;color:var(--subtext);margin-top:3px;font-family:JetBrains Mono,monospace;line-height:1.1;text-align:center">'
+            f'{horse}<br><span style="font-size:8px;color:var(--muted)">{odds:g}</span></div>'
+            f'</div>'
+        )
+
+    html = (
+        f'<div class="panel">'
+        f'<div class="panel-title">📊 {pool_name}投注額棒型圖</div>'
+        f'<div class="panel-sub">棒高＝投注額 · 近1分鐘實質流入 ⚡{_fmt_money(m1)}/🔥{_fmt_money(m2)}/💥{_fmt_money(m3)} 變色（與金額表同步）</div>'
+        f'<div style="display:flex;align-items:flex-end;gap:3px;height:150px;padding:6px 0">'
+        f'{bars}</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
+                       m1=100_000, m2=200_000, m3=400_000):
+    """Per-minute actual stake inflow table (Excel-style).
+    Each row a horse, each column a countdown minute (-8..-1), cell = $ that
+    flowed into that horse that minute. Uses stake = pool×0.825/odds reversal.
+    Only shown when post time known (needs countdown minutes)."""
+    pool_inv = win_inv if pool == "WIN" else pla_inv
+    title = "獨贏" if pool == "WIN" else "位置"
+    if pool_inv is None or pool_inv <= 0:
+        return
+    sub = df[df["池"] == pool].copy()
+    sub = sub[sub["即場"] > 0]
+    if sub.empty:
+        return
+    if mtp is None:
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">📋 每分鐘落注金額表（{title}）</div>'
+            f'<div class="panel-sub">需要開跑時間先計倒數分鐘 — 請喺上方填開跑時間</div></div>',
+            unsafe_allow_html=True)
+        return
+
+    # Build per-minute stake from stake_hist (which stores (ts, stake$)).
+    # We bucket history into countdown-minute bins.
+    post_ts = S["post_time"].timestamp() if S["post_time"] else None
+    now_ts = datetime.now(HKT).timestamp()
+    # minutes to post (negative). current minute index
+    cur_min = int(mtp) if mtp is not None else 0  # e.g. -3
+    # columns: from (cur_min-n_min+1) .. cur_min  (e.g. -8..-1)? show last n_min mins before now
+    start_m = cur_min - (n_min - 1)
+    mins = list(range(start_m, cur_min + 1))  # e.g. [-8,...,0]
+
+    def stake_at(horse, target_ts):
+        """stake of horse at a given wall-clock ts (nearest earlier point)."""
+        hist = S["stake_hist"][(pool, str(horse))]
+        if not hist:
+            return None
+        best = None
+        for ts, v in hist:
+            if ts <= target_ts:
+                best = v
+        return best if best is not None else (hist[0][1] if hist else None)
+
+    rows_data = []
+    for _, r in sub.sort_values("即場").iterrows():
+        horse = str(r["馬號"])
+        odds = r["即場"]
+        per_min = []
+        for m in mins:
+            # ts at end of minute m and minute m-1 (m is negative, closer to 0 = later)
+            if post_ts is None:
+                per_min.append(None); continue
+            ts_end = post_ts + m * 60      # e.g. m=-3 -> 3 min before post
+            ts_start = post_ts + (m - 1) * 60
+            s_end = stake_at(horse, ts_end)
+            s_start = stake_at(horse, ts_start)
+            if s_end is None or s_start is None:
+                per_min.append(None)
+            else:
+                per_min.append(s_end - s_start)
+        rows_data.append((horse, odds, per_min))
+
+    # render
+    def cellcol(v):
+        if v is None: return "var(--muted)"
+        if v >= m3: return "#c878ff"      # 💥 強烈
+        if v >= m2: return "#ff8c3c"      # 🔥 明顯
+        if v >= m1: return "#ffd43b"      # ⚡ 留意
+        return "var(--subtext)"
+    head = '<th style="text-align:left;padding:3px 4px;font-size:9px;color:var(--muted)">馬 賠</th>'
+    for m in mins:
+        lbl = f"{m}分" if m < 0 else "開跑"
+        head += f'<th style="text-align:right;padding:3px 4px;font-size:9px;color:var(--muted)">{lbl}</th>'
+    head += '<th style="text-align:right;padding:3px 4px;font-size:9px;color:#e0a83c">合計</th>'
+    body = ""
+    for horse, odds, per_min in rows_data:
+        tot = sum(v for v in per_min if v)
+        cells = ""
+        for v in per_min:
+            txt = f'+{_fmt_money(v)}' if (v and v > 0) else ('—' if not v else _fmt_money(v))
+            bg = ''
+            if v and v >= m3: bg = 'background:rgba(200,120,255,0.15);'
+            elif v and v >= m2: bg = 'background:rgba(255,140,60,0.15);'
+            elif v and v >= m1: bg = 'background:rgba(255,212,59,0.12);'
+            cells += f'<td style="text-align:right;padding:3px 4px;font-size:10px;color:{cellcol(v)};{bg}font-family:JetBrains Mono,monospace">{txt}</td>'
+        body += (f'<tr><td style="padding:3px 4px;font-size:11px;color:var(--text);white-space:nowrap">'
+                 f'{horse} <span style="font-size:8px;color:var(--subtext)">{odds:g}</span></td>'
+                 f'{cells}'
+                 f'<td style="text-align:right;padding:3px 4px;font-size:10px;color:#e0a83c;font-weight:600;font-family:JetBrains Mono,monospace">{_fmt_money(tot)}</td></tr>')
+
+    html = (
+        f'<div class="panel" style="overflow-x:auto">'
+        f'<div class="panel-title">📋 每分鐘落注金額表（{title} · 倒數分鐘）</div>'
+        f'<div class="panel-sub">每格＝該馬嗰分鐘實質落注（彩池×0.825÷賠率反推）· '
+        f'紅≥$200K 橙≥$100K · 橫掃睇邊分鐘爆</div>'
+        f'<table style="border-collapse:collapse;width:100%">'
+        f'<tr>{head}</tr>{body}</table>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+def combo_matrix_panel(matrix, pool_title, horses):
+    """Render a combination pool (QIN/QPL) as HKJC-style triangular matrix.
+    horses: sorted list of int horse numbers present in the race."""
+    if not matrix or not horses:
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">🎲 {pool_title}</div>'
+            f'<div class="panel-sub">暫無資料</div></div>', unsafe_allow_html=True)
+        return
+    hs = sorted(horses)
+    # find hottest (lowest odds) for highlight
+    min_odds = min(matrix.values()) if matrix else 0
+    # header row: horses[1:] as columns
+    cols = hs[1:]
+    rows_h = hs[:-1]
+
+    def cell(v, hot=False):
+        if v is None:
+            return '<td style="background:#3a4560;padding:3px"></td>'
+        bg = 'background:#c0392b;color:#fff;font-weight:600;' if hot else ''
+        return f'<td style="text-align:center;padding:3px;font-size:10px;{bg}">{v:g}</td>'
+
+    # build header
+    head = f'<td style="background:#1a2a4a;color:#9aa7b8;padding:3px;text-align:center;font-size:9px">{pool_title}</td>'
+    for c in cols:
+        head += f'<td style="background:#2a3550;padding:3px;text-align:center;color:#9aa7b8;font-size:10px">{c}</td>'
+
+    body = ""
+    for ri, rh in enumerate(rows_h):
+        row = f'<td style="background:#3a4560;text-align:center;padding:3px;color:#9aa7b8;font-size:10px">{rh}</td>'
+        for c in cols:
+            if c <= rh:
+                # left of diagonal: blank (or diagonal marker at c == next)
+                row += '<td style="background:#3a4560;padding:3px"></td>'
+            else:
+                pair = (rh, c)
+                odds = matrix.get(pair)
+                row += cell(odds, hot=(odds is not None and odds == min_odds))
+        body += f'<tr>{row}</tr>'
+
+    html = (
+        f'<div class="panel" style="overflow-x:auto">'
+        f'<div class="panel-title">🎲 {pool_title}</div>'
+        f'<div class="panel-sub">紅＝最熱組合（賠率最低 {min_odds:g}）· 交叉格＝該對馬賠率</div>'
+        f'<table style="border-collapse:collapse;width:100%">'
+        f'<tr>{head}</tr>{body}</table>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+def four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
+                         pool_totals, cold_odds=10.0, rise_thresh=0.5):
+    """Four-pool combined heat table with money + 1-min share-rise detection.
+    pool_totals: {'WIN':$, 'PLA':$, 'QIN':$, 'QPL':$} (QIN/QPL are estimates).
+    rise_thresh: flag a horse if its share rose >= this %pts in the last 60s."""
+    win = df[df["池"] == "WIN"].copy()
+    if win.empty:
+        return
+    inv = 1.0 / win["即場"]
+    win["W%"] = inv / inv.sum() * 100.0
+    win_share = {int(k): v for k, v in zip(win["馬號"], win["W%"])}
+
+    # record share history (for 1-min rise) — all four pools
+    for h, v in win_share.items():
+        record_share(S, "WIN", h, v)
+    for h, v in pla_part.items():
+        record_share(S, "PLA", h, v)
+    for h, v in qin_part.items():
+        record_share(S, "QIN", h, v)
+    for h, v in qpl_part.items():
+        record_share(S, "QPL", h, v)
+
+    def topN(part, n=3):
+        return set(sorted(part, key=lambda h: part[h], reverse=True)[:n]) if part else set()
+    top_win = topN(win_share)
+    top_pla = topN(pla_part)
+    top_qin = topN(qin_part)
+    top_qpl = topN(qpl_part)
+
+    wt = pool_totals.get("WIN") or 0
+    pt = pool_totals.get("PLA") or 0
+    qt = pool_totals.get("QIN") or 0
+    qpt = pool_totals.get("QPL") or 0
+    t1 = st.session_state.get("rise_t1", RISE_TIER1)
+    t2 = st.session_state.get("rise_t2", RISE_TIER2)
+    t3 = st.session_state.get("rise_t3", RISE_TIER3)
+
+    rows = []
+    for _, r in win.sort_values("即場").iterrows():
+        h = int(r["馬號"])
+        wo = r["即場"]
+        shares = {"WIN": r["W%"], "PLA": pla_part.get(h, 0.0),
+                  "QIN": qin_part.get(h, 0.0), "QPL": qpl_part.get(h, 0.0)}
+        tops = {"WIN": h in top_win, "PLA": h in top_pla,
+                "QIN": h in top_qin, "QPL": h in top_qpl}
+        nhot = sum(tops.values())
+        suspicious = (wo >= cold_odds) and nhot >= 3
+
+        # 1-min share rise across pools -> tiered
+        rises = {p: share_rise(S, p, h, 60) for p in ("WIN", "PLA", "QIN", "QPL")}
+        max_rise = max(rises.values()) if rises else 0.0
+        if max_rise >= t3:
+            tier, tier_col, tier_tag = 3, "#c878ff", "💥強烈"
+        elif max_rise >= t2:
+            tier, tier_col, tier_tag = 2, "#ff8c3c", "🔥明顯"
+        elif max_rise >= t1:
+            tier, tier_col, tier_tag = 1, "#ffd43b", "⚡留意"
+        else:
+            tier, tier_col, tier_tag = 0, "#5b6675", ""
+
+        # pool % cells: all neutral grey (no green top-3)
+        def cell(pct):
+            return f'<span class="c-num" style="color:#9aa7b8">{pct:.1f}%</span>'
+
+        marker = ""
+        if suspicious:
+            marker = ' 💥可疑' if tier >= 3 else (' 🔥可疑' if tier >= 1 else ' 可疑')
+        elif tier > 0:
+            marker = f' {tier_tag}'
+
+        # row background by strongest signal
+        rowbg = ''
+        if suspicious:
+            rowbg = 'background:rgba(239,87,87,0.10);border-radius:4px;'
+        elif tier == 3:
+            rowbg = 'background:rgba(200,120,255,0.10);border-radius:4px;'
+        elif tier == 2:
+            rowbg = 'background:rgba(255,140,60,0.10);border-radius:4px;'
+        elif tier == 1:
+            rowbg = 'background:rgba(255,212,59,0.08);border-radius:4px;'
+
+        nhot_col = "#ff5757" if suspicious else "#5b6675"
+        rise_disp = f"+{max_rise:.1f}%" if max_rise >= 0.1 else "—"
+
+        rows.append(
+            f'<div class="row" style="{rowbg}">'
+            f'<span class="c-no" style="color:var(--text)">{h}'
+            f'<span style="font-size:9px;color:{"#ff5757" if suspicious else "#9aa7b8"}"> {wo:g}</span>'
+            f'<span style="font-size:9px;color:{tier_col}">{marker}</span></span>'
+            f'{cell(shares["WIN"])}{cell(shares["PLA"])}{cell(shares["QIN"])}{cell(shares["QPL"])}'
+            f'<span class="c-num" style="color:{tier_col};font-weight:600">{rise_disp}</span>'
+            f'<span class="c-num" style="color:{nhot_col};font-weight:600">{nhot}/4</span>'
+            f'</div>'
+        )
+
+    # money reference line: what 1% of each pool is worth
+    def one_pct(v):
+        return _fmt_money(v / 100.0) if v else "—"
+    money_ref = (f'獨贏1%≈{one_pct(wt)} · 位置1%≈{one_pct(pt)} · '
+                 f'連贏1%≈{one_pct(qt)} · 位置Q1%≈{one_pct(qpt)}（連贏/位置Q為粗估）')
+
+    html = (
+        f'<div class="panel">'
+        f'<div class="panel-title">🎯 四池綜合熱度</div>'
+        f'<div class="panel-sub">按獨贏賠率排序 · 平時乾淨 · '
+        f'1分升 ⚡{t1:g}%/🔥{t2:g}%/💥{t3:g}% · 冷馬(≥{cold_odds:g}倍)多池皆熱＝可疑<br>{money_ref}</div>'
+        f'<div class="thead">'
+        f'<span class="c-no">馬 賠率</span>'
+        f'<span class="c-num">獨贏</span><span class="c-num">位置</span>'
+        f'<span class="c-num">連贏</span><span class="c-num">位置Q</span>'
+        f'<span class="c-num">1分升</span><span class="c-num">皆熱</span></div>'
+        f'{"".join(rows)}'
+        f'<div class="legend">'
+        f'<span><i style="background:#ffd43b"></i>⚡留意</span>'
+        f'<span><i style="background:#ff8c3c"></i>🔥明顯</span>'
+        f'<span><i style="background:#c878ff"></i>💥強烈</span>'
+        f'<span><i style="background:#ff5757"></i>冷馬皆熱可疑</span>'
+        f'</div></div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
 # ════════════════════════════════════════════════════════════
 #  HEADER + CONTROLS
 # ════════════════════════════════════════════════════════════
@@ -969,6 +1465,71 @@ with c5:
     st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
     reset_clicked = st.button("🔄 重設此場走勢", use_container_width=True)
 
+# 敏感度設定（可摺疊，唔阻主畫面）
+with st.expander("⚙️ 急升偵測敏感度（分層 · 拉桿微調）"):
+    st.markdown('<div style="font-size:11px;color:var(--subtext);margin-bottom:2px">四池熱度（佔比 %）</div>', unsafe_allow_html=True)
+    sc1, sc2, sc3 = st.columns(3)
+    with sc1:
+        st.session_state["rise_t1"] = st.slider(
+            "⚡ 留意（%）", 0.2, 2.0, st.session_state.get("rise_t1", RISE_TIER1), 0.1)
+    with sc2:
+        st.session_state["rise_t2"] = st.slider(
+            "🔥 明顯（%）", 0.3, 2.5, st.session_state.get("rise_t2", RISE_TIER2), 0.1)
+    with sc3:
+        st.session_state["rise_t3"] = st.slider(
+            "💥 強烈（%）", 0.5, 3.0, st.session_state.get("rise_t3", RISE_TIER3), 0.1)
+    st.markdown('<div style="font-size:11px;color:var(--subtext);margin:8px 0 2px">金額訊號（棒型圖 + 每分鐘金額表）· 千元</div>', unsafe_allow_html=True)
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        _mk1 = st.slider("⚡ 留意（$K）", 20, 500,
+                         st.session_state.get("money_t1_k", MONEY_TIER1 // 1000), 10)
+        st.session_state["money_t1_k"] = _mk1
+        st.session_state["money_t1"] = _mk1 * 1000
+    with mc2:
+        _mk2 = st.slider("🔥 明顯（$K）", 50, 800,
+                         st.session_state.get("money_t2_k", MONEY_TIER2 // 1000), 10)
+        st.session_state["money_t2_k"] = _mk2
+        st.session_state["money_t2"] = _mk2 * 1000
+    with mc3:
+        _mk3 = st.slider("💥 強烈（$K）", 100, 1500,
+                         st.session_state.get("money_t3_k", MONEY_TIER3 // 1000), 50)
+        st.session_state["money_t3_k"] = _mk3
+        st.session_state["money_t3"] = _mk3 * 1000
+    st.caption("四池熱度用佔比%；棒型圖+金額表用實質金額（近1分鐘實質落注），兩個金額表完美同步。低＝多提示、高＝少但精。")
+
+# ── ⏱️ 翻睇控制（LIVE / REPLAY）— 直接顯示，唔收埋 ──
+replay_mode = False
+replay_snaps = None
+replay_idx = None
+st.markdown('<div style="font-size:12px;color:var(--subtext);margin:4px 0 2px">⏱️ 模式</div>',
+            unsafe_allow_html=True)
+mode = st.radio("模式", ["● LIVE 即場", "🔁 REPLAY 翻睇"], horizontal=True,
+                label_visibility="collapsed", key="mode_toggle")
+replay_mode = "REPLAY" in mode
+if replay_mode:
+    saved = list_saved_races()
+    if not saved:
+        st.info("暫時未有已儲存嘅場次記錄。開住一場（有彩池數據）幾分鐘，佢會每 30 秒自動記低，之後就可以喺呢度揀返翻睇。")
+    else:
+        rc1, rc2 = st.columns([1, 2])
+        with rc1:
+            pick = st.selectbox("揀場次", saved, index=len(saved) - 1)
+        replay_snaps = load_snapshots(pick)
+        if replay_snaps:
+            n = len(replay_snaps)
+            def _lbl(i):
+                s = replay_snaps[i]
+                pt = s.get("post_time")
+                if pt:
+                    mtp = (s["ts"] - pt) / 60.0
+                    return f"開跑前 {abs(mtp):.0f} 分" if mtp < 0 else "開跑後"
+                return datetime.fromtimestamp(s["ts"], HKT).strftime("%H:%M:%S")
+            with rc2:
+                replay_idx = st.slider("時間軸（拉去任何一刻）", 0, n - 1, n - 1)
+            st.caption(f"時間點：{_lbl(replay_idx)}　（共 {n} 個記錄點，每 30 秒一個）")
+        else:
+            st.info("呢場冇記錄點")
+
 # Get this race's own state (creates it if first visit; keeps existing on return)
 race_key = f"{race_date}|{course}|{race_no}"
 if reset_clicked:
@@ -981,8 +1542,8 @@ manual_post = None
 if post_input.strip():
     try:
         hh, mm = post_input.strip().split(":")
-        manual_post = datetime.now(HKT).replace(hour=int(hh), minute=int(mm),
-                                                second=0, microsecond=0)
+        manual_post = datetime(race_date.year, race_date.month, race_date.day,
+                               int(hh), int(mm), 0, tzinfo=HKT)
     except Exception:
         manual_post = None
 
@@ -1037,11 +1598,42 @@ this_inv = turnover_map.get(int(race_no), {})
 win_inv = this_inv.get("WIN")
 pla_inv = this_inv.get("PLA")
 
+# Fetch QIN (連贏) + QPL (位置Q) odds for this race (only oddsTypes var changes,
+# query string unchanged -> whitelist-safe). Kept separate from WIN/PLA flow.
+try:
+    combo_pools = fetch_combo(str(race_date), course, int(race_no))
+except Exception:
+    combo_pools = []
+qin_matrix = combo_to_matrix(combo_pools, "QIN")
+qpl_matrix = combo_to_matrix(combo_pools, "QPL")
+qin_part = combo_participation(qin_matrix)
+qpl_part = combo_participation(qpl_matrix)
+
 # Post time: AUTO DISABLED (實時開跑時間唔穩定). Manual override only.
 # If manual is empty -> post_time None -> elapsed-time axis (no double-line risk).
 S["post_time"] = manual_post
 
 df = pools_to_df(pools)
+
+# ── REPLAY 覆蓋：用揀咗嘅 snapshot 重建數據（唔用即場）──
+if replay_mode and replay_snaps and replay_idx is not None:
+    snap = replay_snaps[replay_idx]
+    rows_r = []
+    for h, o in (snap.get("win") or {}).items():
+        rows_r.append({"池": "WIN", "馬號": h, "賠率": float(o), "大熱": False})
+    for h, o in (snap.get("pla") or {}).items():
+        rows_r.append({"池": "PLA", "馬號": h, "賠率": float(o), "大熱": False})
+    df = pd.DataFrame(rows_r)
+    _p = snap.get("pool") or {}
+    win_inv = _p.get("WIN"); pla_inv = _p.get("PLA")
+    this_inv = {"WIN": _p.get("WIN"), "PLA": _p.get("PLA"),
+                "QIN": _p.get("QIN"), "QPL": _p.get("QPL")}
+    qin_matrix = {tuple(int(x) for x in k.split(",")): v for k, v in (snap.get("qin") or {}).items()}
+    qpl_matrix = {tuple(int(x) for x in k.split(",")): v for k, v in (snap.get("qpl") or {}).items()}
+    qin_part = combo_participation(qin_matrix)
+    qpl_part = combo_participation(qpl_matrix)
+    if snap.get("post_time"):
+        S["post_time"] = datetime.fromtimestamp(snap["post_time"], HKT)
 
 if df.empty:
     st.markdown(
@@ -1064,9 +1656,66 @@ if df.empty:
 else:
     df, mtp = enrich(df, S)
 
-    # Record current stake ($) per horse for surge detection (only when pool known)
-    record_stakes(df[df["池"] == "WIN"], "WIN", win_inv, S)
-    record_stakes(df[df["池"] == "PLA"], "PLA", pla_inv, S)
+    if replay_mode and replay_snaps and replay_idx is not None:
+        # REPLAY: rebuild series & stake_hist from snapshots up to replay_idx,
+        # so surge / 1-min-rise / per-minute table reflect that historical moment.
+        snap_now = replay_snaps[replay_idx]
+        S["series"] = defaultdict(lambda: deque(maxlen=400))
+        S["stake_hist"] = defaultdict(lambda: deque(maxlen=400))
+        S["share_hist"] = defaultdict(lambda: deque(maxlen=400))
+        S["open_odds"] = {}
+        for si in range(replay_idx + 1):
+            sp = replay_snaps[si]
+            ts = sp["ts"]
+            pinv = sp.get("pool") or {}
+            for pool_code, odds_map in (("WIN", sp.get("win")), ("PLA", sp.get("pla"))):
+                if not odds_map:
+                    continue
+                inv_sum = sum(1.0 / float(o) for o in odds_map.values() if float(o) > 0)
+                ptot = pinv.get(pool_code)
+                for h, o in odds_map.items():
+                    o = float(o)
+                    if o <= 0:
+                        continue
+                    key = (pool_code, h)
+                    S["series"][key].append((ts, o))
+                    if key not in S["open_odds"]:
+                        S["open_odds"][key] = o
+                    if ptot and inv_sum > 0:
+                        share = (1.0 / o) / inv_sum
+                        S["stake_hist"][key].append((ts, share * ptot))
+                        S["share_hist"][(pool_code, str(h))].append((ts, share * 100.0))
+        # mtp from snapshot time vs post
+        if snap_now.get("post_time"):
+            mtp = (snap_now["ts"] - snap_now["post_time"]) / 60.0
+        else:
+            mtp = None
+    else:
+        # Record current stake ($) per horse for surge detection (only when pool known)
+        record_stakes(df[df["池"] == "WIN"], "WIN", win_inv, S)
+        record_stakes(df[df["池"] == "PLA"], "PLA", pla_inv, S)
+
+        # ── 寫硬碟 snapshot（每 30 秒一次）──
+        _snap_key = f"_last_snap_{race_key}"
+        _now_epoch = datetime.now(HKT).timestamp()
+        _last_snap = st.session_state.get(_snap_key, 0)
+        if _now_epoch - _last_snap >= SNAPSHOT_INTERVAL:
+            try:
+                snap = {
+                    "ts": _now_epoch,
+                    "race_key": race_key,
+                    "post_time": S["post_time"].timestamp() if S["post_time"] else None,
+                    "win": {str(r["馬號"]): r["即場"] for _, r in df[df["池"] == "WIN"].iterrows()},
+                    "pla": {str(r["馬號"]): r["即場"] for _, r in df[df["池"] == "PLA"].iterrows()},
+                    "pool": {"WIN": win_inv, "PLA": pla_inv,
+                             "QIN": this_inv.get("QIN"), "QPL": this_inv.get("QPL")},
+                    "qin": {f"{a},{b}": o for (a, b), o in qin_matrix.items()},
+                    "qpl": {f"{a},{b}": o for (a, b), o in qpl_matrix.items()},
+                }
+                save_snapshot(race_key, snap)
+                st.session_state[_snap_key] = _now_epoch
+            except Exception:
+                pass
 
     # ── post-time / countdown status line ──
     if S["post_time"] is not None and mtp is not None:
@@ -1132,70 +1781,67 @@ else:
             f'<b>插水警示</b>　{no} 號於 {PLUNGE_WINDOW} 秒內急跌 {pct:.0f}%，即場 {odds:.1f}</div>',
             unsafe_allow_html=True)
 
-    # ── per-race pool turnover banner ──
-    race_total = (win_inv or 0) + (pla_inv or 0)
-    if win_inv or pla_inv:
+    # ═══ ① 四彩池投注額 ═══
+    if win_inv or pla_inv or this_inv.get("QIN") or this_inv.get("QPL"):
         def _tcard(label, val, accent):
             return (f'<div style="flex:1;background:var(--card);border:1px solid var(--border);'
-                    f'border-radius:10px;padding:8px 14px;position:relative;overflow:hidden">'
+                    f'border-radius:10px;padding:8px 12px;position:relative;overflow:hidden">'
                     f'<div style="position:absolute;top:0;left:0;right:0;height:2px;background:{accent}"></div>'
                     f'<div style="font-family:JetBrains Mono,monospace;font-size:10px;color:var(--subtext);'
-                    f'letter-spacing:0.08em">{label}</div>'
-                    f'<div style="font-size:20px;font-weight:600;color:var(--text);margin-top:2px">'
+                    f'letter-spacing:0.06em">{label}</div>'
+                    f'<div style="font-size:18px;font-weight:600;color:var(--text);margin-top:2px">'
                     f'{_fmt_money(val)}</div></div>')
         st.markdown(
-            f'<div style="display:flex;gap:10px;margin-bottom:10px">'
-            f'{_tcard("獨贏池 WIN", win_inv, INFO)}'
-            f'{_tcard("位置池 PLA", pla_inv, "#3b82f6")}'
-            f'{_tcard("本場合計 WIN+PLA", race_total, "#e0a83c")}'
+            f'<div style="display:flex;gap:8px;margin-bottom:10px">'
+            f'{_tcard("獨贏 WIN", win_inv, INFO)}'
+            f'{_tcard("位置 PLA", pla_inv, "#3b82f6")}'
+            f'{_tcard("連贏 QIN", this_inv.get("QIN"), "#e0a83c")}'
+            f'{_tcard("位置Q QPL", this_inv.get("QPL"), "#b48c3c")}'
             f'</div>',
             unsafe_allow_html=True)
 
-    # ── main: win & place trend side by side ──
-    use_countdown = S["post_time"] is not None
-    col_w, col_p = st.columns(2)
-    with col_w:
-        trend_panel(df[df["池"] == "WIN"], S, "獨贏賠率走勢", countdown=use_countdown)
-    with col_p:
-        trend_panel(df[df["池"] == "PLA"], S, "位置賠率走勢", countdown=use_countdown)
+    # ═══ ② 連贏 / 位置Q 賠率矩陣 ═══
+    race_horses = sorted(int(x) for x in df[df["池"] == "WIN"]["馬號"].tolist())
+    if qin_matrix or qpl_matrix:
+        qcol1, qcol2 = st.columns(2)
+        with qcol1:
+            combo_matrix_panel(qin_matrix, "連贏 QIN", race_horses)
+        with qcol2:
+            combo_matrix_panel(qpl_matrix, "位置Q QPL", race_horses)
 
-    # ── ranking boards ──
-    win_df = df[df["池"] == "WIN"]
-    pla_df = df[df["池"] == "PLA"]
-    rcol1, rcol2 = st.columns(2)
-    with rcol1:
-        rank_panel(win_df, S, True, "獨贏落飛榜 · 前六", "獨贏由開賠跌得最多（有錢入）")
-    with rcol2:
-        rank_panel(pla_df, S, True, "位置落飛榜 · 前六", "位置由開賠跌得最多（有錢入）")
+    # PLA per-horse participation (share% within place pool)
+    _pla = df[df["池"] == "PLA"].copy()
+    if not _pla.empty:
+        _inv = 1.0 / _pla["即場"]
+        pla_part = {int(h): v for h, v in zip(_pla["馬號"], _inv / _inv.sum() * 100.0)}
+    else:
+        pla_part = {}
 
-    # ── divergence ──
-    divergence_panel(df)
+    # ═══ ③ 四池綜合熱度（分層 ⚡🔥💥）═══
+    pool_totals = {"WIN": win_inv, "PLA": pla_inv,
+                   "QIN": this_inv.get("QIN"), "QPL": this_inv.get("QPL")}
+    rise_thresh = st.session_state.get("rise_thresh", 0.5)
+    four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
+                         pool_totals, cold_odds=10.0, rise_thresh=rise_thresh)
 
-    # ── money flow (signal = 近30秒賠率跌幅 + 100分綜合評分) ──
-    # Precompute each pool's recent drops so scoring can check cross-pool agreement.
-    def _pool_drops(pool):
-        out = {}
-        for _, rr in df[df["池"] == pool].iterrows():
-            dp, _ = recent_speed(S, (pool, rr["馬號"]), SURGE_WINDOW)
-            out[rr["馬號"]] = dp
-        return out
-    win_drops = _pool_drops("WIN")
-    pla_drops = _pool_drops("PLA")
-
-    mcol1, mcol2 = st.columns(2)
-    with mcol1:
-        moneyflow_panel(df[df["池"] == "WIN"], "獨贏", pool_inv=win_inv, S=S, mtp=mtp,
-                        other_pool_drops=pla_drops)
-    with mcol2:
-        moneyflow_panel(df[df["池"] == "PLA"], "位置", pool_inv=pla_inv, S=S, mtp=mtp,
-                        other_pool_drops=win_drops)
-
-    # ── stake bar charts (獨贏 / 位置) — visual overview of pool stakes ──
+    # ═══ ④ 投注額棒型圖（直向）═══
+    _m1 = st.session_state.get("money_t1", MONEY_TIER1)
+    _m2 = st.session_state.get("money_t2", MONEY_TIER2)
+    _m3 = st.session_state.get("money_t3", MONEY_TIER3)
+    bar_sort = st.radio("棒型圖排序", ["順馬號", "順賠率（熱→冷）"], horizontal=True,
+                        label_visibility="collapsed", key="bar_sort")
+    sort_key = "賠率" if "賠率" in bar_sort else "馬號"
     bcol1, bcol2 = st.columns(2)
     with bcol1:
-        stake_bar_chart(df[df["池"] == "WIN"], "獨贏", win_inv, S)
+        stake_bar_chart_v(df[df["池"] == "WIN"], "獨贏", win_inv, S,
+                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3)
     with bcol2:
-        stake_bar_chart(df[df["池"] == "PLA"], "位置", pla_inv, S)
+        stake_bar_chart_v(df[df["池"] == "PLA"], "位置", pla_inv, S,
+                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3)
+
+    # ═══ ⑤ 每分鐘落注金額表（獨贏 / 位置）═══
+    minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", m1=_m1, m2=_m2, m3=_m3)
+    minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="PLA", m1=_m1, m2=_m2, m3=_m3)
 
     # ── footer ──
     now_str = datetime.now(HKT).strftime("%H:%M:%S")
