@@ -11,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v15.5 STHV"
+APP_VERSION = "v16.0 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -585,6 +585,31 @@ def stake_change_since_open(S, pool_name, horse):
         return 0.0
     return hist[-1][1] - hist[0][1]   # live stake - first-seen stake
 
+def stake_at_ts(S, pool_name, horse, target_ts):
+    """該馬喺 target_ts（或之前最接近）嘅累積投注額（佔比法）。冇就 None。"""
+    hist = S["stake_hist"][(pool_name, str(horse))]
+    if not hist:
+        return None
+    best = None
+    for ts, v in hist:
+        if ts <= target_ts:
+            best = v
+    return best if best is not None else hist[0][1]
+
+def stake_in_bucket(S, pool_name, horse, ts_start, ts_end):
+    """該馬喺 [ts_start, ts_end] 呢段流入嘅金額 = end 累積 − start 累積。
+    佔比法，同棒型圖同一把尺。"""
+    s_end = stake_at_ts(S, pool_name, horse, ts_end)
+    s_start = stake_at_ts(S, pool_name, horse, ts_start)
+    if s_end is None or s_start is None:
+        return None
+    return s_end - s_start
+
+def current_stake(S, pool_name, horse):
+    """該馬即場累積總投注額（佔比法，= 棒型圖棒高 = 每分鐘表合計）。"""
+    hist = S["stake_hist"][(pool_name, str(horse))]
+    return hist[-1][1] if hist else None
+
 # ════════════════════════════════════════════════════════════
 #  RENDER HELPERS
 # ════════════════════════════════════════════════════════════
@@ -1108,11 +1133,25 @@ def stake_bar_chart(df_pool, pool_name, pool_inv, S):
     )
     st.markdown(html, unsafe_allow_html=True)
 
+def _nice_ceiling(maxv):
+    """自動揀靚頂 + 間格（1/2/2.5/5 × 10^n），目標約 5 格。"""
+    import math
+    if maxv <= 0:
+        return 100000, 20000
+    raw = maxv / 5.0
+    mag = 10 ** math.floor(math.log10(raw))
+    step = mag
+    for m in (1, 2, 2.5, 5, 10):
+        step = m * mag
+        if step >= raw:
+            break
+    top = math.ceil(maxv / step) * step
+    return int(top), int(step)
+
 def stake_bar_chart_v(df_pool, pool_name, pool_inv, S, sort_by="馬號",
-                      m1=100_000, m2=200_000, m3=400_000):
-    """Vertical bar chart (volume-bar style): each horse a bar rising from the
-    bottom; height = stake ($). Signal by 1-min actual inflow $ (money tiers,
-    synced with the minute table). sort_by: '馬號' or '賠率'."""
+                      m1=100_000, m2=200_000, m3=400_000, mtp=None):
+    """直向棒型圖：棒高＝總投注額（佔比法，= 每分鐘表合計）。
+    棒色＝最近一個完整分鐘流入（同每分鐘表 -1分格同步）。Y軸金額刻度（自動跟最大）。"""
     if pool_inv is None or pool_inv <= 0:
         st.markdown(
             f'<div class="panel"><div class="panel-title">📊 {pool_name}投注額棒型圖</div>'
@@ -1122,41 +1161,64 @@ def stake_bar_chart_v(df_pool, pool_name, pool_inv, S, sort_by="馬號",
     if sub.empty:
         st.markdown(
             f'<div class="panel"><div class="panel-title">📊 {pool_name}投注額棒型圖</div>'
-            f'<div class="panel-sub">有彩池金額 {_fmt_money(pool_inv)}，但未有逐匹馬賠率 — '
-            f'開賣初期或該池賠率未更新，有賠率就會自動出棒</div></div>', unsafe_allow_html=True)
+            f'<div class="panel-sub">有彩池金額 {_fmt_money(pool_inv)}，但未有逐匹馬賠率</div></div>',
+            unsafe_allow_html=True)
         return
     pool_code = str(df_pool["池"].iloc[0]) if len(df_pool) else pool_name
     inv_live = 1.0 / sub["即場"]
-    sub["投注額"] = inv_live / inv_live.sum() * pool_inv
+    sub["投注額"] = inv_live / inv_live.sum() * pool_inv   # 即場總投注（佔比法）
     if sort_by == "賠率":
-        sub = sub.sort_values("即場")  # hot -> cold
+        sub = sub.sort_values("即場")
     else:
         sub = sub.sort_values("馬號", key=lambda s: pd.to_numeric(s, errors="coerce"))
     max_stake = sub["投注額"].max() if len(sub) else 1
+    top, step = _nice_ceiling(max_stake)
+
+    # 最近一個完整分鐘窗（同每分鐘表 -1分格一致）
+    now_ts = datetime.now(HKT).timestamp()
+    m_end, m_start = now_ts, now_ts - 60
+
+    # Y軸刻度 HTML（絕對定位喺左邊）
+    yaxis = ""
+    t = 0
+    while t <= top:
+        frac = t / top if top else 0
+        if t >= 1_000_000:
+            ylbl = f"{t/1_000_000:.1f}M"
+        elif t > 0:
+            ylbl = f"{int(t/1000)}K"
+        else:
+            ylbl = "0"
+        yaxis += (f'<div style="position:absolute;left:0;right:0;bottom:{frac*100:.1f}%;'
+                  f'border-top:1px solid rgba(40,48,62,0.9);height:0">'
+                  f'<span style="position:absolute;left:0;top:-7px;font-size:8px;color:var(--muted);'
+                  f'font-family:JetBrains Mono,monospace">{ylbl}</span></div>')
+        t += step
 
     bars = ""
     for _, r in sub.iterrows():
         horse = r["馬號"]
         odds = r["即場"]
         stake = r["投注額"]
-        # signal = actual $ inflow in last 60s (money tiers) — synced w/ minute table
-        inflow = recent_stake_gain(S, pool_code, horse, 60) if S is not None else 0.0
+        # 棒色：最近一個完整分鐘流入（同每分鐘表同步）
+        inflow = stake_in_bucket(S, pool_code, horse, m_start, m_end) if S is not None else None
+        inflow = inflow or 0.0
         if inflow >= m3:
-            bcol = "#c878ff"       # 💥 強烈
+            bcol = "#c878ff"
         elif inflow >= m2:
-            bcol = "#ff8c3c"       # 🔥 明顯
+            bcol = "#ff8c3c"
         elif inflow >= m1:
-            bcol = "#ffd43b"       # ⚡ 留意
+            bcol = "#ffd43b"
         else:
             bcol = INFO
-        h_px = max(4, int(stake / max_stake * 120)) if max_stake > 0 else 4
+        h_pct = max(1.5, stake / top * 100) if top > 0 else 1.5
         inflow_lbl = (f'<div style="font-size:8px;color:{bcol};height:12px;text-align:center;white-space:nowrap">'
                       f'{("+"+_fmt_money(inflow)) if inflow>=m1 else ""}</div>')
         bars += (
             f'<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;min-width:0">'
             f'{inflow_lbl}'
-            f'<div style="width:70%;height:{h_px}px;background:{bcol};border-radius:3px 3px 0 0;'
-            f'opacity:0.9"></div>'
+            f'<div style="width:70%;height:{h_pct:.1f}%;background:{bcol};border-radius:3px 3px 0 0;'
+            f'min-height:2px;opacity:0.9"></div>'
             f'<div style="font-size:10px;color:var(--subtext);margin-top:3px;font-family:JetBrains Mono,monospace;line-height:1.1;text-align:center">'
             f'{horse}<br><span style="font-size:8px;color:var(--muted)">{odds:g}</span></div>'
             f'</div>'
@@ -1165,9 +1227,12 @@ def stake_bar_chart_v(df_pool, pool_name, pool_inv, S, sort_by="馬號",
     html = (
         f'<div class="panel">'
         f'<div class="panel-title">📊 {pool_name}投注額棒型圖</div>'
-        f'<div class="panel-sub">棒高＝投注額 · 近1分鐘實質流入 ⚡{_fmt_money(m1)}/🔥{_fmt_money(m2)}/💥{_fmt_money(m3)} 變色（與金額表同步）</div>'
-        f'<div style="display:flex;align-items:flex-end;gap:3px;height:150px;padding:6px 0">'
-        f'{bars}</div>'
+        f'<div class="panel-sub">棒高＝總投注金額（Y軸自動刻度）· 近1分鐘流入 ⚡{_fmt_money(m1)}黃/🔥{_fmt_money(m2)}橙/💥{_fmt_money(m3)}紫 變色（與金額表同步）</div>'
+        f'<div style="display:flex;gap:6px">'
+        f'<div style="position:relative;width:150px;height:160px;flex:1;padding-left:30px">'
+        f'<div style="position:absolute;left:30px;right:0;top:0;bottom:20px">{yaxis}</div>'
+        f'<div style="display:flex;align-items:flex-end;gap:3px;height:100%;position:relative">{bars}</div>'
+        f'</div></div>'
         f'</div>'
     )
     st.markdown(html, unsafe_allow_html=True)
@@ -1193,79 +1258,126 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
             unsafe_allow_html=True)
         return
 
-    # Build per-minute stake from stake_hist (which stores (ts, stake$)).
-    # We bucket history into countdown-minute bins.
+    # Build non-linear timeline buckets (left=早段 -> right=開跑).
     post_ts = S["post_time"].timestamp() if S["post_time"] else None
     now_ts = datetime.now(HKT).timestamp()
-    # minutes to post (negative). current minute index
-    cur_min = int(mtp) if mtp is not None else 0  # e.g. -3
-    # columns: from (cur_min-n_min+1) .. cur_min  (e.g. -8..-1)? show last n_min mins before now
-    start_m = cur_min - (n_min - 1)
-    mins = list(range(start_m, cur_min + 1))  # e.g. [-8,...,0]
 
-    def stake_at(horse, target_ts):
-        """stake of horse at a given wall-clock ts (nearest earlier point)."""
-        hist = S["stake_hist"][(pool, str(horse))]
-        if not hist:
+    # 每格定義：(label, is_countdown, minutes_before_post_for_END_edge)
+    # 由早到遲（左到右）。臨場逐分鐘、中段中疏、早段每2鐘（用實際時間）。
+    # bucket i 覆蓋 [edge[i-1], edge[i]] 段（累積差）。
+    # edges 用「開跑前幾多分鐘」表示（越大越早）。
+    minute_edges = [60, 30, 15, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]  # 中段+臨場（分鐘）
+    # 早段：由開賣到 -60分，每 120 分鐘一格（實際時間顯示）
+    early_edges = []
+    if post_ts is not None:
+        # 由 -60分 再往早，每 120 分一格，去到「有記錄嘅最早時間」
+        earliest = S["stake_hist"] and min(
+            (h[0][0] for h in S["stake_hist"].values() if h), default=now_ts)
+        earliest_min_before = (post_ts - earliest) / 60.0 if earliest else 60
+        e = 180
+        while e <= earliest_min_before + 120 and e <= 24 * 60:
+            early_edges.append(e)
+            e += 120
+        early_edges = sorted(set(early_edges), reverse=True)  # 大到細（早到遲）
+
+    # 完整 edge 序列（早 -> 遲）：early(大) ... 60,30,...,0
+    all_edges = early_edges + minute_edges  # e.g. [ ...300,180, 60,30,15,10,9..0 ]
+
+    def edge_ts(min_before):
+        return post_ts - min_before * 60 if post_ts is not None else None
+
+    def label_for(min_before, is_first_early):
+        if min_before <= 0:
+            return ("開跑", False, False)
+        if min_before in (60, 30, 15, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1):
+            return (f"-{min_before}分", False, False)
+        # 早段：用實際時間
+        ts = edge_ts(min_before)
+        dt = datetime.fromtimestamp(ts, HKT)
+        hhmm = dt.strftime("%H:%M")
+        # 「昨」= 唔同開跑日
+        post_dt = datetime.fromtimestamp(post_ts, HKT)
+        is_prev = dt.date() < post_dt.date()
+        return (hhmm, True, is_prev)
+
+    # columns = each bucket between consecutive edges (start=older, end=newer)
+    # 第一格由「最早記錄」到第一個 edge
+    cols = []   # list of (label, is_hour, is_prev, ts_start, ts_end)
+    prev_edge = None
+    for idx, mb in enumerate(all_edges):
+        e_end = edge_ts(mb)
+        if prev_edge is None:
+            e_start = None  # 由最早
+        else:
+            e_start = edge_ts(prev_edge)
+        lbl, is_hour, is_prev = label_for(mb, idx == 0)
+        cols.append((lbl, is_hour, is_prev, e_start, e_end))
+        prev_edge = mb
+
+    def stake_bucket(horse, ts_start, ts_end):
+        if ts_end is None:
             return None
-        best = None
-        for ts, v in hist:
-            if ts <= target_ts:
-                best = v
-        return best if best is not None else (hist[0][1] if hist else None)
+        if ts_start is None:
+            # 由最早記錄到 ts_end 嘅累積
+            s_end = stake_at_ts(S, pool, horse, ts_end)
+            hist = S["stake_hist"][(pool, str(horse))]
+            s_start = hist[0][1] if hist else None
+            if s_end is None or s_start is None:
+                return None
+            return s_end - s_start
+        return stake_in_bucket(S, pool, horse, ts_start, ts_end)
 
     rows_data = []
     for _, r in sub.sort_values("即場").iterrows():
         horse = str(r["馬號"])
         odds = r["即場"]
-        per_min = []
-        for m in mins:
-            # ts at end of minute m and minute m-1 (m is negative, closer to 0 = later)
-            if post_ts is None:
-                per_min.append(None); continue
-            ts_end = post_ts + m * 60      # e.g. m=-3 -> 3 min before post
-            ts_start = post_ts + (m - 1) * 60
-            s_end = stake_at(horse, ts_end)
-            s_start = stake_at(horse, ts_start)
-            if s_end is None or s_start is None:
-                per_min.append(None)
-            else:
-                per_min.append(s_end - s_start)
-        rows_data.append((horse, odds, per_min))
+        per_col = [stake_bucket(horse, s, e) for (_, _, _, s, e) in cols]
+        rows_data.append((horse, odds, per_col))
 
-    # render
-    def cellcol(v):
-        if v is None: return "var(--muted)"
-        if v >= m3: return "#c878ff"      # 💥 強烈
-        if v >= m2: return "#ff8c3c"      # 🔥 明顯
-        if v >= m1: return "#ffd43b"      # ⚡ 留意
+    def cellcol(v, is_hour):
+        if v is None:
+            return "var(--muted)"
+        if is_hour:
+            return "var(--subtext)"   # 早段唔變色
+        if v >= m3: return "#c878ff"
+        if v >= m2: return "#ff8c3c"
+        if v >= m1: return "#ffd43b"
         return "var(--subtext)"
-    head = '<th style="text-align:left;padding:3px 4px;font-size:9px;color:var(--muted)">馬 賠</th>'
-    for m in mins:
-        lbl = f"{m}分" if m < 0 else "開跑"
-        head += f'<th style="text-align:right;padding:3px 4px;font-size:9px;color:var(--muted)">{lbl}</th>'
-    head += '<th style="text-align:right;padding:3px 4px;font-size:9px;color:#e0a83c">合計</th>'
+
+    # header
+    head = '<th style="text-align:left;padding:3px 5px;font-size:9px;color:var(--muted);position:sticky;left:0;background:var(--card)">馬 賠</th>'
+    for (lbl, is_hour, is_prev, _, _) in cols:
+        prev_tag = '<div style="font-size:7px;color:#78899a;line-height:1">昨</div>' if is_prev else ''
+        col_bg = "background:rgba(30,30,44,0.5);" if is_hour else ""
+        head += (f'<th style="text-align:right;padding:2px 5px;font-size:9px;color:{"#78899a" if is_hour else "var(--muted)"};{col_bg}">'
+                 f'{prev_tag}{lbl}</th>')
+    head += '<th style="text-align:right;padding:3px 5px;font-size:9px;color:#e0a83c">合計</th>'
+
     body = ""
-    for horse, odds, per_min in rows_data:
-        tot = sum(v for v in per_min if v)
+    for horse, odds, per_col in rows_data:
+        # 合計 = 即場總投注（佔比法，同棒型圖棒高一致）
+        total = current_stake(S, pool, horse)
+        if total is None:
+            total = sum(v for v in per_col if v) or 0
         cells = ""
-        for v in per_min:
+        for (lbl, is_hour, is_prev, _, _), v in zip(cols, per_col):
             txt = f'+{_fmt_money(v)}' if (v and v > 0) else ('—' if not v else _fmt_money(v))
             bg = ''
-            if v and v >= m3: bg = 'background:rgba(200,120,255,0.15);'
-            elif v and v >= m2: bg = 'background:rgba(255,140,60,0.15);'
-            elif v and v >= m1: bg = 'background:rgba(255,212,59,0.12);'
-            cells += f'<td style="text-align:right;padding:3px 4px;font-size:10px;color:{cellcol(v)};{bg}font-family:JetBrains Mono,monospace">{txt}</td>'
-        body += (f'<tr><td style="padding:3px 4px;font-size:11px;color:var(--text);white-space:nowrap">'
+            if not is_hour and v:
+                if v >= m3: bg = 'background:rgba(200,120,255,0.15);'
+                elif v >= m2: bg = 'background:rgba(255,140,60,0.15);'
+                elif v >= m1: bg = 'background:rgba(255,212,59,0.12);'
+            cells += f'<td style="text-align:right;padding:2px 5px;font-size:10px;color:{cellcol(v,is_hour)};{bg}font-family:JetBrains Mono,monospace">{txt}</td>'
+        body += (f'<tr><td style="padding:3px 5px;font-size:11px;color:var(--text);white-space:nowrap;position:sticky;left:0;background:var(--card)">'
                  f'{horse} <span style="font-size:8px;color:var(--subtext)">{odds:g}</span></td>'
                  f'{cells}'
-                 f'<td style="text-align:right;padding:3px 4px;font-size:10px;color:#e0a83c;font-weight:600;font-family:JetBrains Mono,monospace">{_fmt_money(tot)}</td></tr>')
+                 f'<td style="text-align:right;padding:3px 5px;font-size:10px;color:#e0a83c;font-weight:600;font-family:JetBrains Mono,monospace">{_fmt_money(total)}</td></tr>')
 
     html = (
         f'<div class="panel" style="overflow-x:auto">'
-        f'<div class="panel-title">📋 每分鐘落注金額表（{title} · 倒數分鐘）</div>'
-        f'<div class="panel-sub">每格＝該馬嗰分鐘實質落注（彩池×0.825÷賠率反推）· '
-        f'紅≥$200K 橙≥$100K · 橫掃睇邊分鐘爆</div>'
+        f'<div class="panel-title">📋 落注金額表（{title} · 時間由左到右）</div>'
+        f'<div class="panel-sub">每格＝嗰段流入 · 早段(左·實際時間+昨) → 開跑(最右) · '
+        f'臨場逐分鐘 ⚡{_fmt_money(m1)}黃/🔥{_fmt_money(m2)}橙/💥{_fmt_money(m3)}紫（只臨場格變色）· 合計＝總投注（同棒型圖）</div>'
         f'<table style="border-collapse:collapse;width:100%">'
         f'<tr>{head}</tr>{body}</table>'
         f'</div>'
@@ -1834,10 +1946,10 @@ else:
     bcol1, bcol2 = st.columns(2)
     with bcol1:
         stake_bar_chart_v(df[df["池"] == "WIN"], "獨贏", win_inv, S,
-                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3)
+                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp)
     with bcol2:
         stake_bar_chart_v(df[df["池"] == "PLA"], "位置", pla_inv, S,
-                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3)
+                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp)
 
     # ═══ ⑤ 每分鐘落注金額表（獨贏 / 位置）═══
     minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", m1=_m1, m2=_m2, m3=_m3)
