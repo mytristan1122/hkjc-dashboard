@@ -11,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v16.0 STHV"
+APP_VERSION = "v16.1 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -71,6 +71,19 @@ def load_snapshots(race_key):
         return snaps
     except Exception:
         return []
+
+def load_latest_snapshot(race_key):
+    """讀該場最新一個 snapshot（LIVE 讀硬碟用，快、唔使拉 HKJC）。"""
+    try:
+        rd = _race_dir(race_key)
+        files = glob.glob(os.path.join(rd, "*.json"))
+        if not files:
+            return None
+        latest = max(files, key=lambda p: int(os.path.basename(p)[:-5]))
+        with open(latest, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 # ════════════════════════════════════════════════════════════
 #  CONFIG / CONSTANTS
@@ -1300,19 +1313,32 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
         is_prev = dt.date() < post_dt.date()
         return (hhmm, True, is_prev)
 
+    # 方案C（#6）：早段（開賣→60分前）預設摺埋一格；剔「展開早段」先細分。
+    show_early = st.session_state.get(f"early_open_{pool}", False)
+
     # columns = each bucket between consecutive edges (start=older, end=newer)
-    # 第一格由「最早記錄」到第一個 edge
     cols = []   # list of (label, is_hour, is_prev, ts_start, ts_end)
-    prev_edge = None
-    for idx, mb in enumerate(all_edges):
-        e_end = edge_ts(mb)
-        if prev_edge is None:
-            e_start = None  # 由最早
-        else:
+    if show_early:
+        # 展開：早段逐格（實際時間）+ 臨場
+        prev_edge = None
+        for idx, mb in enumerate(all_edges):
+            e_end = edge_ts(mb)
+            e_start = None if prev_edge is None else edge_ts(prev_edge)
+            lbl, is_hour, is_prev = label_for(mb, idx == 0)
+            cols.append((lbl, is_hour, is_prev, e_start, e_end))
+            prev_edge = mb
+    else:
+        # 摺埋：早段一格（由最早 → -60分），之後臨場逐格
+        cols.append(("開賣→60分前", True, False, None, edge_ts(60)))
+        prev_edge = 60
+        for mb in minute_edges:
+            if mb >= 60:
+                continue
+            e_end = edge_ts(mb)
             e_start = edge_ts(prev_edge)
-        lbl, is_hour, is_prev = label_for(mb, idx == 0)
-        cols.append((lbl, is_hour, is_prev, e_start, e_end))
-        prev_edge = mb
+            lbl, is_hour, is_prev = label_for(mb, False)
+            cols.append((lbl, is_hour, is_prev, e_start, e_end))
+            prev_edge = mb
 
     def stake_bucket(horse, ts_start, ts_end):
         if ts_end is None:
@@ -1609,6 +1635,13 @@ with st.expander("⚙️ 急升偵測敏感度（分層 · 拉桿微調）"):
         st.session_state["money_t3"] = _mk3 * 1000
     st.caption("四池熱度用佔比%；棒型圖+金額表用實質金額（近1分鐘實質落注），兩個金額表完美同步。低＝多提示、高＝少但精。")
 
+# ── 📡 資料來源：讀硬碟（recorder 記錄·快·自動開跑時間）定 直接連線（拉 HKJC）──
+st.markdown('<div style="font-size:12px;color:var(--subtext);margin:4px 0 2px">📡 資料來源</div>',
+            unsafe_allow_html=True)
+data_src = st.radio("資料來源", ["💾 雲端記錄（讀硬碟·快）", "🌐 直接連線（拉HKJC）"],
+                    horizontal=True, label_visibility="collapsed", key="data_src")
+use_disk = "雲端" in data_src
+
 # ── ⏱️ 翻睇控制（LIVE / REPLAY）— 直接顯示，唔收埋 ──
 replay_mode = False
 replay_snaps = None
@@ -1668,24 +1701,29 @@ window = [n for n in range(int(race_no), int(race_no) + 3) if 1 <= n <= 14]
 
 # Fetch + record the *background* races first (not the current one).
 # Small spacing between calls avoids hammering HKJC.
-for bg_no in window:
-    if bg_no == int(race_no):
-        continue
-    bg_key = f"{race_date}|{course}|{bg_no}"
-    bg_state = get_state(bg_key)
-    try:
-        bg_pools = fetch_race(str(race_date), course, bg_no)
-        record_into_state(bg_pools, bg_state)
-    except Exception:
-        pass
-    _time.sleep(0.15)
+# 讀硬碟模式唔使拉 HKJC（recorder 已經背景記緊）
+if not use_disk:
+    for bg_no in window:
+        if bg_no == int(race_no):
+            continue
+        bg_key = f"{race_date}|{course}|{bg_no}"
+        bg_state = get_state(bg_key)
+        try:
+            bg_pools = fetch_race(str(race_date), course, bg_no)
+            record_into_state(bg_pools, bg_state)
+        except Exception:
+            pass
+        _time.sleep(0.15)
 
 # Now fetch the current (displayed) race
-try:
-    pools = fetch_race(str(race_date), course, int(race_no))
-except Exception as e:
-    st.error(f"⚠️ 連線失敗：{e}")
-    pools = []
+if use_disk:
+    pools = []      # 下面用 disk snapshot 重建
+else:
+    try:
+        pools = fetch_race(str(race_date), course, int(race_no))
+    except Exception as e:
+        st.error(f"⚠️ 連線失敗：{e}")
+        pools = []
 
 # Pool turnover (彩池金額) — cached, refreshed at most every 20s so it never
 # slows the 5s odds cycle. If it fails, money flow falls back to percentage.
@@ -1698,7 +1736,7 @@ _tnow = datetime.now(HKT)
 _need = (st.session_state.turnover_cache_key != _tkey
          or st.session_state.turnover_cache_ts is None
          or (_tnow - st.session_state.turnover_cache_ts).total_seconds() >= 20)
-if _need:
+if _need and not use_disk:
     try:
         st.session_state.turnover_cache = fetch_turnover(str(race_date), course)
     except Exception:
@@ -1712,10 +1750,13 @@ pla_inv = this_inv.get("PLA")
 
 # Fetch QIN (連贏) + QPL (位置Q) odds for this race (only oddsTypes var changes,
 # query string unchanged -> whitelist-safe). Kept separate from WIN/PLA flow.
-try:
-    combo_pools = fetch_combo(str(race_date), course, int(race_no))
-except Exception:
+if use_disk:
     combo_pools = []
+else:
+    try:
+        combo_pools = fetch_combo(str(race_date), course, int(race_no))
+    except Exception:
+        combo_pools = []
 qin_matrix = combo_to_matrix(combo_pools, "QIN")
 qpl_matrix = combo_to_matrix(combo_pools, "QPL")
 qin_part = combo_participation(qin_matrix)
@@ -1726,6 +1767,32 @@ qpl_part = combo_participation(qpl_matrix)
 S["post_time"] = manual_post
 
 df = pools_to_df(pools)
+
+# ── 讀硬碟 LIVE：用最新 snapshot 重建（唔拉 HKJC，快、自動開跑時間）──
+if use_disk and not replay_mode:
+    _snap = load_latest_snapshot(race_key)
+    if _snap:
+        rows_d = []
+        for h, o in (_snap.get("win") or {}).items():
+            rows_d.append({"池": "WIN", "馬號": h, "賠率": float(o), "大熱": False})
+        for h, o in (_snap.get("pla") or {}).items():
+            rows_d.append({"池": "PLA", "馬號": h, "賠率": float(o), "大熱": False})
+        df = pd.DataFrame(rows_d)
+        _pp = _snap.get("pool") or {}
+        win_inv = _pp.get("WIN"); pla_inv = _pp.get("PLA")
+        this_inv = {"WIN": _pp.get("WIN"), "PLA": _pp.get("PLA"),
+                    "QIN": _pp.get("QIN"), "QPL": _pp.get("QPL")}
+        qin_matrix = {tuple(int(x) for x in k.split(",")): v
+                      for k, v in (_snap.get("qin") or {}).items()}
+        qpl_matrix = {tuple(int(x) for x in k.split(",")): v
+                      for k, v in (_snap.get("qpl") or {}).items()}
+        qin_part = combo_participation(qin_matrix)
+        qpl_part = combo_participation(qpl_matrix)
+        if _snap.get("post_time"):
+            S["post_time"] = datetime.fromtimestamp(_snap["post_time"], HKT)  # 自動開跑時間
+    else:
+        st.info("💾 雲端記錄模式：呢場暫時未有記錄（recorder 開賣後會自動記）。想即刻睇可揀「🌐 直接連線」。")
+
 
 # ── REPLAY 覆蓋：用揀咗嘅 snapshot 重建數據（唔用即場）──
 if replay_mode and replay_snaps and replay_idx is not None:
@@ -1952,6 +2019,13 @@ else:
                           sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp)
 
     # ═══ ⑤ 每分鐘落注金額表（獨贏 / 位置）═══
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        st.session_state["early_open_WIN"] = st.checkbox(
+            "獨贏：展開早段細分", value=st.session_state.get("early_open_WIN", False))
+    with ec2:
+        st.session_state["early_open_PLA"] = st.checkbox(
+            "位置：展開早段細分", value=st.session_state.get("early_open_PLA", False))
     minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", m1=_m1, m2=_m2, m3=_m3)
     minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="PLA", m1=_m1, m2=_m2, m3=_m3)
 
