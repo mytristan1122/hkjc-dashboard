@@ -11,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v16.1 STHV"
+APP_VERSION = "v17.0 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -325,6 +325,77 @@ def fetch_race(date_str, course, race_no):
         if m.get("pmPools"):
             return m["pmPools"]
     return []
+
+def fetch_all_meetings():
+    """#8：用 activeMeetings 自動攞晒所有『有賽事』嘅日期+場地（包括海外）。
+    Returns list of {date, venue, label, races}. 唔使手動揀日期/場地。"""
+    out = []
+    try:
+        payload = {"operationName": "raceMeetings",
+                   "variables": {"date": None, "venueCode": None},
+                   "query": TURNOVER_QUERY}
+        r = requests.post(API, headers=HEADERS, json=payload, timeout=20)
+        j = r.json()
+        if isinstance(j, dict) and j.get("errors"):
+            return []
+        ams = (j.get("data", {}) or {}).get("activeMeetings", []) or []
+        for m in ams:
+            d = (m.get("date") or "")[:10]
+            v = m.get("venueCode")
+            if not d or not v:
+                continue
+            races = m.get("races") or []
+            out.append({"date": d, "venue": v, "n_races": len(races),
+                        "status": m.get("status"), "races": races})
+    except Exception:
+        return []
+    # 去重 + 按日期排
+    seen = set(); uniq = []
+    for m in out:
+        k = (m["date"], m["venue"])
+        if k in seen:
+            continue
+        seen.add(k); uniq.append(m)
+    return sorted(uniq, key=lambda x: (x["date"], x["venue"]))
+
+VENUE_NAMES = {"ST": "沙田", "HV": "跑馬地"}
+def venue_label(v):
+    return VENUE_NAMES.get(v, v)   # 海外場地就直接顯示 code
+
+def fetch_race_info(date_str, venue, race_no):
+    """#9：攞某場賽事資料（班次/距離/跑道/名稱/開跑時間），用嚟做 header。"""
+    try:
+        payload = {"operationName": "raceMeetings",
+                   "variables": {"date": date_str, "venueCode": venue},
+                   "query": TURNOVER_QUERY}
+        r = requests.post(API, headers=HEADERS, json=payload, timeout=20)
+        j = r.json()
+        if isinstance(j, dict) and j.get("errors"):
+            return None
+        meetings = (j.get("data", {}) or {}).get("raceMeetings", []) or []
+        if not meetings:
+            return None
+        m = meetings[0]
+        info = {"venue": m.get("venueCode"), "date": (m.get("date") or "")[:10],
+                "dow": m.get("dateOfWeek"), "total": m.get("totalNumberOfRace")}
+        for rc in (m.get("races") or []):
+            if rc.get("no") == int(race_no):
+                track = (rc.get("raceTrack") or {}).get("description_ch")
+                course_d = (rc.get("raceCourse") or {}).get("description_ch")
+                info.update({
+                    "no": rc.get("no"),
+                    "name": rc.get("raceName_ch"),
+                    "post": rc.get("postTime"),
+                    "dist": rc.get("distance"),
+                    "cls": rc.get("raceClass_ch"),
+                    "track": track, "course": course_d,
+                    "going": rc.get("go_ch"),
+                    "field": rc.get("wageringFieldSize"),
+                })
+                break
+        return info
+    except Exception:
+        return None
 
 def fetch_turnover(date_str, course):
     """Return {race_no: {'WIN': float, 'PLA': float, 'post': str}, 'total': float}.
@@ -1588,17 +1659,56 @@ st.markdown(
     f'<span class="live"><span class="live-dot"></span>實時 · 5秒</span></div>',
     unsafe_allow_html=True)
 
-c1, c2, c3, c4, c5 = st.columns([1.8, 1.2, 1, 1.4, 1.4])
+# ── #8：自動同步馬會賽期（列出所有有賽事嘅日期+場地，包括海外）──
+if "meetings_cache" not in st.session_state:
+    st.session_state.meetings_cache = []
+    st.session_state.meetings_cache_ts = None
+_mnow = datetime.now(HKT)
+if (st.session_state.meetings_cache_ts is None
+        or (_mnow - st.session_state.meetings_cache_ts).total_seconds() >= 300):
+    try:
+        st.session_state.meetings_cache = fetch_all_meetings()
+    except Exception:
+        st.session_state.meetings_cache = []
+    st.session_state.meetings_cache_ts = _mnow
+_meetings = st.session_state.meetings_cache or []
+
+c1, c2, c3, c4, c5 = st.columns([2.4, 1, 1, 1.4, 1.4])
 with c1:
-    race_date = st.date_input("日期", date.today())
+    if _meetings:
+        opts = [f"{m['date']} · {venue_label(m['venue'])} ({m['venue']}) · {m['n_races']}場"
+                for m in _meetings]
+        # default: 最接近今日嘅賽事
+        _today = date.today().isoformat()
+        _def = 0
+        for i, m in enumerate(_meetings):
+            if m["date"] >= _today:
+                _def = i
+                break
+        pick_idx = st.selectbox("賽事（自動同步馬會）", range(len(opts)),
+                                format_func=lambda i: opts[i], index=_def)
+        _sel = _meetings[pick_idx]
+        race_date = datetime.strptime(_sel["date"], "%Y-%m-%d").date()
+        course = _sel["venue"]
+        _max_race = max(1, _sel["n_races"] or 14)
+    else:
+        st.warning("暫時攞唔到馬會賽期，用手動揀")
+        race_date = st.date_input("日期", date.today())
+        course = "ST"
+        _max_race = 14
 with c2:
-    course = st.selectbox("場地", ["ST", "HV"],
-                          format_func=lambda x: "沙田 ST" if x == "ST" else "跑馬地 HV")
+    if not _meetings:
+        course = st.selectbox("場地", ["ST", "HV"],
+                              format_func=lambda x: f"{venue_label(x)} {x}")
+    else:
+        st.markdown(f'<div style="font-size:9px;color:var(--subtext);margin-top:6px">場地</div>'
+                    f'<div style="font-size:14px;color:var(--text);font-weight:600">'
+                    f'{venue_label(course)} {course}</div>', unsafe_allow_html=True)
 with c3:
-    race_no = st.number_input("場次", 1, 14, 1)
+    race_no = st.number_input("場次", 1, int(_max_race), 1)
 with c4:
-    post_input = st.text_input("開跑時間 (可選)", value="", placeholder="例 14:46",
-                               help="留空即用「開機後經過時間」做軸。若想對齊開跑倒數，可手動填 HH:MM。")
+    post_input = st.text_input("開跑時間 (可選)", value="", placeholder="自動/可覆蓋",
+                               help="讀硬碟模式會自動攞開跑時間。想手動覆蓋先填 HH:MM。")
 with c5:
     st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
     reset_clicked = st.button("🔄 重設此場走勢", use_container_width=True)
@@ -1959,6 +2069,41 @@ else:
             f'<div class="alert-bar">⚠️ '
             f'<b>插水警示</b>　{no} 號於 {PLUNGE_WINDOW} 秒內急跌 {pct:.0f}%，即場 {odds:.1f}</div>',
             unsafe_allow_html=True)
+
+    # ═══ #9 賽事資料 header（跟馬會格式）═══
+    _rinfo_key = f"rinfo_{race_date}_{course}_{race_no}"
+    if _rinfo_key not in st.session_state:
+        try:
+            st.session_state[_rinfo_key] = fetch_race_info(str(race_date), course, int(race_no))
+        except Exception:
+            st.session_state[_rinfo_key] = None
+    _ri = st.session_state.get(_rinfo_key)
+    if _ri and _ri.get("no"):
+        _pt = ""
+        if _ri.get("post"):
+            try:
+                _pdt = datetime.fromisoformat(_ri["post"].replace("Z", "+00:00")).astimezone(HKT)
+                _pt = _pdt.strftime("%H:%M")
+            except Exception:
+                _pt = ""
+        _bits = [b for b in [
+            _pt, _ri.get("cls"), f'{_ri.get("dist")}米' if _ri.get("dist") else None,
+            _ri.get("track"), _ri.get("course"),
+            f'場地{_ri.get("going")}' if _ri.get("going") else None,
+            f'{_ri.get("field")}匹' if _ri.get("field") else None,
+        ] if b]
+        _rname = _ri.get("name") or ""
+        _name_html = (f'<div style="font-size:11px;color:var(--muted);margin-top:2px">{_rname}</div>'
+                      if _rname else "")
+        st.markdown(
+            f'<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;'
+            f'padding:8px 14px;margin-bottom:10px">'
+            f'<span style="font-size:13px;font-weight:600;color:var(--text)">'
+            f'{_ri.get("date","")} {venue_label(_ri.get("venue",""))} · 第 {_ri["no"]} 場</span>'
+            f'<span style="font-size:11px;color:var(--subtext);margin-left:10px">'
+            f'{" · ".join(_bits)}</span>'
+            f'{_name_html}'
+            f'</div>', unsafe_allow_html=True)
 
     # ═══ ① 四彩池投注額 ═══
     if win_inv or pla_inv or this_inv.get("QIN") or this_inv.get("QPL"):
