@@ -11,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.0 STHV"
+APP_VERSION = "v17.1 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -1263,17 +1263,18 @@ def stake_bar_chart_v(df_pool, pool_name, pool_inv, S, sort_by="馬號",
     m_end, m_start = now_ts, now_ts - 60
 
     # Y軸刻度 HTML（絕對定位喺左邊）
+    PLOT_H = 130
     yaxis = ""
     t = 0
     while t <= top:
-        frac = t / top if top else 0
+        y_px = int(t / top * PLOT_H) if top else 0
         if t >= 1_000_000:
             ylbl = f"{t/1_000_000:.1f}M"
         elif t > 0:
             ylbl = f"{int(t/1000)}K"
         else:
             ylbl = "0"
-        yaxis += (f'<div style="position:absolute;left:0;right:0;bottom:{frac*100:.1f}%;'
+        yaxis += (f'<div style="position:absolute;left:0;right:0;bottom:{y_px}px;'
                   f'border-top:1px solid rgba(40,48,62,0.9);height:0">'
                   f'<span style="position:absolute;left:0;top:-7px;font-size:8px;color:var(--muted);'
                   f'font-family:JetBrains Mono,monospace">{ylbl}</span></div>')
@@ -1295,14 +1296,15 @@ def stake_bar_chart_v(df_pool, pool_name, pool_inv, S, sort_by="馬號",
             bcol = "#ffd43b"
         else:
             bcol = INFO
-        h_pct = max(1.5, stake / top * 100) if top > 0 else 1.5
+        PLOT_H = 130   # 繪圖區高度（px），棒用 px 計，唔用 % （% 會因為父層冇固定高而塌）
+        h_px = max(2, int(stake / top * PLOT_H)) if top > 0 else 2
         inflow_lbl = (f'<div style="font-size:8px;color:{bcol};height:12px;text-align:center;white-space:nowrap">'
                       f'{("+"+_fmt_money(inflow)) if inflow>=m1 else ""}</div>')
         bars += (
             f'<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;min-width:0">'
             f'{inflow_lbl}'
-            f'<div style="width:70%;height:{h_pct:.1f}%;background:{bcol};border-radius:3px 3px 0 0;'
-            f'min-height:2px;opacity:0.9"></div>'
+            f'<div style="width:70%;height:{h_px}px;background:{bcol};border-radius:3px 3px 0 0;'
+            f'opacity:0.9"></div>'
             f'<div style="font-size:10px;color:var(--subtext);margin-top:3px;font-family:JetBrains Mono,monospace;line-height:1.1;text-align:center">'
             f'{horse}<br><span style="font-size:8px;color:var(--muted)">{odds:g}</span></div>'
             f'</div>'
@@ -1312,11 +1314,10 @@ def stake_bar_chart_v(df_pool, pool_name, pool_inv, S, sort_by="馬號",
         f'<div class="panel">'
         f'<div class="panel-title">📊 {pool_name}投注額棒型圖</div>'
         f'<div class="panel-sub">棒高＝總投注金額（Y軸自動刻度）· 近1分鐘流入 ⚡{_fmt_money(m1)}黃/🔥{_fmt_money(m2)}橙/💥{_fmt_money(m3)}紫 變色（與金額表同步）</div>'
-        f'<div style="display:flex;gap:6px">'
-        f'<div style="position:relative;width:150px;height:160px;flex:1;padding-left:30px">'
-        f'<div style="position:absolute;left:30px;right:0;top:0;bottom:20px">{yaxis}</div>'
-        f'<div style="display:flex;align-items:flex-end;gap:3px;height:100%;position:relative">{bars}</div>'
-        f'</div></div>'
+        f'<div style="position:relative;padding-left:34px">'
+        f'<div style="position:absolute;left:0;right:0;bottom:26px;height:130px">{yaxis}</div>'
+        f'<div style="display:flex;align-items:flex-end;gap:3px;position:relative">{bars}</div>'
+        f'</div>'
         f'</div>'
     )
     st.markdown(html, unsafe_allow_html=True)
