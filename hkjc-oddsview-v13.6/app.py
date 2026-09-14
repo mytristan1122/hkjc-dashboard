@@ -11,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.2 STHV"
+APP_VERSION = "v17.4 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -135,6 +135,50 @@ def sync_state_from_disk(race_key, S):
                     S["stake_hist"][key].append((ts, share * ptot))
                     S["share_hist"][(pool_code, str(h))].append((ts, share * 100.0))
     S["_disk_synced_ts"] = max_ts
+
+def _signal_log_path(race_key):
+    return os.path.join(_race_dir(race_key), "signals.jsonl")
+
+def append_signal_log(race_key, event):
+    """即刻寫一行落硬碟（每次訊號一觸發就寫，唔使等30秒snapshot）。"""
+    try:
+        rd = _race_dir(race_key)
+        os.makedirs(rd, exist_ok=True)
+        with open(_signal_log_path(race_key), "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def load_signal_log(race_key, since_ts=0.0):
+    """讀返呢場所有（或指定時間之後）嘅訊號記錄。"""
+    events = []
+    try:
+        path = _signal_log_path(race_key)
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    if ev.get("ts", 0) > since_ts:
+                        events.append(ev)
+    except Exception:
+        pass
+    return events
+
+def sync_signal_log_from_disk(race_key, S):
+    """轉場次/重開之後，由硬碟補返記憶體漏咗嘅訊號記錄。"""
+    last_ts = S.get("_signal_log_synced_ts", 0.0)
+    new_events = load_signal_log(race_key, last_ts)
+    if not new_events:
+        return
+    for ev in new_events:
+        S["signal_log"].append(ev)
+        S["_signal_log_synced_ts"] = max(S.get("_signal_log_synced_ts", 0.0), ev.get("ts", 0.0))
 
 # ════════════════════════════════════════════════════════════
 #  CONFIG / CONSTANTS
@@ -333,6 +377,10 @@ def _blank_state():
         "share_hist": defaultdict(lambda: deque(maxlen=400)),  # (pool,horse)->[(ts,share%)]
         "post_time": None,    # datetime in HKT
         "started_at": None,   # when monitoring began
+        "signal_log": deque(maxlen=300),  # [{ts,horse,pool,tier,rise}] 30分鐘訊號記錄
+        "_last_logged_tier": {},   # horse -> 上次記錄嘅 tier（升級先再記，避免洗版）
+        "_last_logged_ts": {},     # horse -> 上次記錄時間（同 tier 相同時隔60秒先再記）
+        "_signal_log_synced_ts": 0.0,  # 由硬碟補齊 signal_log 補到邊
     }
 
 # RACES: race_key -> state dict. Switching races no longer wipes data;
@@ -1642,6 +1690,31 @@ def four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
         else:
             tier, tier_col, tier_tag = 0, "#5b6675", ""
 
+        # ── 記錄落 30分鐘訊號log（升級即記；同級每60秒先再記一次，唔會5秒refresh就洗版）──
+        last_tier_map = S.setdefault("_last_logged_tier", {})
+        last_ts_map = S.setdefault("_last_logged_ts", {})
+        prev_tier = last_tier_map.get(h, 0)
+        now_ts_sig = datetime.now(HKT).timestamp()
+        should_log = False
+        if tier > 0:
+            if tier > prev_tier or (now_ts_sig - last_ts_map.get(h, 0)) >= 60:
+                should_log = True
+        if should_log:
+            cause_pool = max(rises, key=rises.get)
+            event = {"ts": now_ts_sig, "horse": h, "pool": cause_pool,
+                     "tier": tier, "rise": round(max_rise, 2)}
+            S["signal_log"].append(event)
+            race_key_now = S.get("race_key")
+            if race_key_now:
+                try:
+                    append_signal_log(race_key_now, event)
+                except Exception:
+                    pass
+            last_tier_map[h] = tier
+            last_ts_map[h] = now_ts_sig
+        elif tier == 0:
+            last_tier_map[h] = 0
+
         # pool % cells: all neutral grey (no green top-3)
         def cell(pct):
             return f'<span class="c-num" style="color:#9aa7b8">{pct:.1f}%</span>'
@@ -1677,11 +1750,20 @@ def four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
             f'</div>'
         )
 
-    # money reference line: what 1% of each pool is worth
-    def one_pct(v):
-        return _fmt_money(v / 100.0) if v else "—"
-    money_ref = (f'獨贏1%≈{one_pct(wt)} · 位置1%≈{one_pct(pt)} · '
-                 f'連贏1%≈{one_pct(qt)} · 位置Q1%≈{one_pct(qpt)}（連贏/位置Q為粗估）')
+    # money reference line: 直接將⚡/🔥/💥三級門檻（%）換算做各池實際觸發金額（$），
+    # 對應真正決定訊號嘅 share_rise() 門檻，唔使用戶自己攞「1%」再心算一次。
+    def tier_money(total, pct):
+        return _fmt_money(total * pct / 100.0) if total else "—"
+    money_ref = (
+        f'觸發金額對照（即場彩池 × 門檻%）：'
+        f'⚡{t1:g}% 獨贏{tier_money(wt, t1)}/位置{tier_money(pt, t1)}/'
+        f'連贏{tier_money(qt, t1)}/位置Q{tier_money(qpt, t1)}　'
+        f'🔥{t2:g}% 獨贏{tier_money(wt, t2)}/位置{tier_money(pt, t2)}/'
+        f'連贏{tier_money(qt, t2)}/位置Q{tier_money(qpt, t2)}　'
+        f'💥{t3:g}% 獨贏{tier_money(wt, t3)}/位置{tier_money(pt, t3)}/'
+        f'連贏{tier_money(qt, t3)}/位置Q{tier_money(qpt, t3)}'
+        f'（連贏/位置Q金額為粗估）'
+    )
 
     html = (
         f'<div class="panel">'
@@ -1702,6 +1784,51 @@ def four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
         f'</div></div>'
     )
     st.markdown(html, unsafe_allow_html=True)
+
+def signal_summary_panel(events, minutes=30, as_of_ts=None):
+    """30分鐘訊號彙總（右邊新面板）：按馬分組，撳開睇逐行時序細節。
+    events: list of {ts,horse,pool,tier,rise}。as_of_ts=None 用而家時間；
+    REPLAY 模式會傳返嗰個snapshot嘅ts，等個30分鐘窗跟返翻睇緊嗰一刻。"""
+    if as_of_ts is None:
+        as_of_ts = datetime.now(HKT).timestamp()
+    cutoff = as_of_ts - minutes * 60
+    evs_in_window = [e for e in events if cutoff <= e.get("ts", 0) <= as_of_ts]
+
+    st.markdown(
+        f'<div class="panel">'
+        f'<div class="panel-title">🕐 {minutes}分鐘訊號彙總</div>'
+        f'<div class="panel-sub">按馬分組 · 撳隻馬展開時序細節 · 過咗{minutes}分鐘自動移除</div>'
+        f'</div>', unsafe_allow_html=True)
+
+    if not evs_in_window:
+        st.caption("暫無訊號")
+        return
+
+    by_horse = defaultdict(list)
+    for e in evs_in_window:
+        by_horse[e["horse"]].append(e)
+
+    tier_emoji = {1: "⚡", 2: "🔥", 3: "💥"}
+
+    def horse_key(h):
+        evs = by_horse[h]
+        return (-max(ev["tier"] for ev in evs), -max(ev["ts"] for ev in evs))
+
+    for h in sorted(by_horse.keys(), key=horse_key):
+        evs = sorted(by_horse[h], key=lambda e: e["ts"], reverse=True)
+        counts = {1: 0, 2: 0, 3: 0}
+        for e in evs:
+            counts[e["tier"]] = counts.get(e["tier"], 0) + 1
+        summary = "　".join(f'{tier_emoji[t]}×{counts[t]}' for t in (3, 2, 1) if counts.get(t))
+        with st.expander(f"{h}號　{summary}", expanded=False):
+            for e in evs:
+                t_str = datetime.fromtimestamp(e["ts"], HKT).strftime("%H:%M:%S")
+                st.markdown(
+                    f'<div style="display:flex;gap:8px;font-size:11px;padding:2px 0">'
+                    f'<span style="color:var(--muted);width:56px">{t_str}</span>'
+                    f'<span style="color:var(--subtext);width:36px">{e["pool"]}</span>'
+                    f'<span style="color:var(--text)">{tier_emoji.get(e["tier"], "")} +{e["rise"]:.1f}%</span>'
+                    f'</div>', unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════════
 #  HEADER + CONTROLS
@@ -1849,6 +1976,10 @@ else:
 if not replay_mode:
     try:
         sync_state_from_disk(race_key, S)
+    except Exception:
+        pass
+    try:
+        sync_signal_log_from_disk(race_key, S)
     except Exception:
         pass
 
@@ -2201,12 +2332,22 @@ else:
     else:
         pla_part = {}
 
-    # ═══ ③ 四池綜合熱度（分層 ⚡🔥💥）═══
+    # ═══ ③ 四池綜合熱度（分層 ⚡🔥💥）+ 30分鐘訊號彙總 ═══
     pool_totals = {"WIN": win_inv, "PLA": pla_inv,
                    "QIN": this_inv.get("QIN"), "QPL": this_inv.get("QPL")}
     rise_thresh = st.session_state.get("rise_thresh", 0.5)
-    four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
-                         pool_totals, cold_odds=10.0, rise_thresh=rise_thresh)
+    hcol1, hcol2 = st.columns([1.3, 1])
+    with hcol1:
+        four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
+                             pool_totals, cold_odds=10.0, rise_thresh=rise_thresh)
+    with hcol2:
+        if replay_mode and replay_snaps and replay_idx is not None:
+            _sig_events = load_signal_log(race_key, 0.0)
+            _sig_as_of = replay_snaps[replay_idx]["ts"]
+        else:
+            _sig_events = list(S["signal_log"])
+            _sig_as_of = None
+        signal_summary_panel(_sig_events, minutes=30, as_of_ts=_sig_as_of)
 
     # ═══ ④ 投注額棒型圖（直向）═══
     _m1 = st.session_state.get("money_t1", MONEY_TIER1)
