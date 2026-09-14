@@ -11,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.1 STHV"
+APP_VERSION = "v17.2 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -84,6 +84,57 @@ def load_latest_snapshot(race_key):
             return json.load(f)
     except Exception:
         return None
+
+def sync_state_from_disk(race_key, S):
+    """讀硬碟已經記錄咗嘅 snapshot，補返落 S 嘅 series/stake_hist/share_hist。
+
+    解決問題：LIVE 畫面轉去第2場、再轉返第1場，記憶體入面 S 若果因為
+    session 中斷 / 一段時間冇顯示而跟唔到 recorder 嘅記錄，落注金額表
+    就會顯示唔到之前嘅數。Recorder 一直背景寫緊硬碟（唔理你而家睇緊邊
+    場），所以呢個 function 令 LIVE 同 REPLAY 用返同一個「硬碟為準」嘅
+    數據源：每次顯示呢場，都由硬碟補齊記憶體漏咗嘅時間點（只補新嘅，
+    已經有嘅時間點唔會重覆加，所以成本好細）。"""
+    try:
+        snaps = load_snapshots(race_key)
+    except Exception:
+        snaps = []
+    if not snaps:
+        return
+    last_synced = S.get("_disk_synced_ts", 0.0)
+    new_snaps = [sp for sp in snaps if sp.get("ts", 0) > last_synced]
+    if not new_snaps:
+        return
+    max_ts = last_synced
+    for sp in new_snaps:
+        ts = sp.get("ts")
+        if ts is None:
+            continue
+        max_ts = max(max_ts, ts)
+        pinv = sp.get("pool") or {}
+        for pool_code, odds_map in (("WIN", sp.get("win")), ("PLA", sp.get("pla"))):
+            if not odds_map:
+                continue
+            try:
+                inv_sum = sum(1.0 / float(o) for o in odds_map.values() if float(o) > 0)
+            except Exception:
+                inv_sum = 0.0
+            ptot = pinv.get(pool_code)
+            for h, o in odds_map.items():
+                try:
+                    o = float(o)
+                except Exception:
+                    continue
+                if o <= 0:
+                    continue
+                key = (pool_code, h)
+                S["series"][key].append((ts, o))
+                if key not in S["open_odds"]:
+                    S["open_odds"][key] = o
+                if ptot and inv_sum > 0:
+                    share = (1.0 / o) / inv_sum
+                    S["stake_hist"][key].append((ts, share * ptot))
+                    S["share_hist"][(pool_code, str(h))].append((ts, share * 100.0))
+    S["_disk_synced_ts"] = max_ts
 
 # ════════════════════════════════════════════════════════════
 #  CONFIG / CONSTANTS
@@ -1792,6 +1843,14 @@ if reset_clicked:
     S = reset_state(race_key)
 else:
     S = get_state(race_key)
+
+# 轉場次 / 重新揀返呢場之後，由硬碟補返記憶體漏咗嘅歷史（REPLAY 自己會
+# 由 snapshot 完整重建，唔使呢步；只在 LIVE 先做）。
+if not replay_mode:
+    try:
+        sync_state_from_disk(race_key, S)
+    except Exception:
+        pass
 
 # Manual override (optional). If filled, it wins over auto post time.
 manual_post = None
