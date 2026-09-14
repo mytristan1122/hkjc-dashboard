@@ -1,4 +1,3 @@
-
 import streamlit as st
 import requests
 import time as _time
@@ -11,7 +10,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.6 STHV"
+APP_VERSION = "v17.7 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -1729,11 +1728,11 @@ def four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
     def tier_money(total, pct):
         return _fmt_money(total * pct / 100.0) if total else "—"
     money_ref = (
-        f'觸發金額對照（即場彩池 × 門檻%）：'
+        f'觸發金額對照（即場彩池 × 門檻%）：<br>'
         f'⚡{t1:g}% 獨贏{tier_money(wt, t1)}/位置{tier_money(pt, t1)}/'
-        f'連贏{tier_money(qt, t1)}/位置Q{tier_money(qpt, t1)}　'
+        f'連贏{tier_money(qt, t1)}/位置Q{tier_money(qpt, t1)}<br>'
         f'🔥{t2:g}% 獨贏{tier_money(wt, t2)}/位置{tier_money(pt, t2)}/'
-        f'連贏{tier_money(qt, t2)}/位置Q{tier_money(qpt, t2)}　'
+        f'連贏{tier_money(qt, t2)}/位置Q{tier_money(qpt, t2)}<br>'
         f'💥{t3:g}% 獨贏{tier_money(wt, t3)}/位置{tier_money(pt, t3)}/'
         f'連贏{tier_money(qt, t3)}/位置Q{tier_money(qpt, t3)}'
         f'（連贏/位置Q金額為粗估）'
