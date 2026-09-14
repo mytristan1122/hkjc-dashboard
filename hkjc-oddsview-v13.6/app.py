@@ -11,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.4 STHV"
+APP_VERSION = "v17.6 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -339,6 +339,21 @@ html, body, .stApp { background:var(--bg)!important; color:var(--text); font-fam
 .pill-win { background:rgba(24,95,165,0.18); color:#5ea0e0; }
 .pill-mute { background:rgba(255,255,255,0.06); color:var(--subtext); }
 .empty { text-align:center; padding:3rem; color:var(--subtext); }
+
+/* ── st.container(border=True) 改返跟 .panel 一樣嘅深色風格（右邊訊號彙總用）── */
+[data-testid="stVerticalBlockBorderWrapper"] {
+  background:var(--card) !important; border:1px solid var(--border) !important;
+  border-radius:12px !important; padding:2px 14px 14px !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stExpander"] {
+  background:transparent; border:1px solid var(--border); border-radius:8px; margin-bottom:4px;
+}
+
+/* ── ③四池熱度 + 30分鐘訊號彙總：兩個column stretch去到一樣高 ── */
+.st-key-heat_signal_row [data-testid="stHorizontalBlock"] { align-items:stretch; }
+.st-key-heat_signal_row [data-testid="column"] > div { height:100%; }
+.st-key-heat_signal_row .panel { height:100%; box-sizing:border-box; }
+.st-key-heat_signal_row [data-testid="stVerticalBlockBorderWrapper"] { height:100%; box-sizing:border-box; }
 
 /* ── 手機優化（窄螢幕）── */
 @media (max-width: 640px) {
@@ -1442,74 +1457,33 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
             unsafe_allow_html=True)
         return
 
-    # Build non-linear timeline buckets (left=早段 -> right=開跑).
+    # ── 時間軸格仔（左＝早，右＝開跑）── v17.5：隔夜/當日 + 固定60/30/20/10 + 逐分鐘。
+    # 隔夜/當日嘅邊界用固定嘅 00:00（唔理個別場次開跑時間），解決 #6b：
+    # 同一日唔同場開跑時間唔同，但早段（隔夜/當日）理應完全一致。
     post_ts = S["post_time"].timestamp() if S["post_time"] else None
-    now_ts = datetime.now(HKT).timestamp()
-
-    # 每格定義：(label, is_countdown, minutes_before_post_for_END_edge)
-    # 由早到遲（左到右）。臨場逐分鐘、中段中疏、早段每2鐘（用實際時間）。
-    # bucket i 覆蓋 [edge[i-1], edge[i]] 段（累積差）。
-    # edges 用「開跑前幾多分鐘」表示（越大越早）。
-    minute_edges = [60, 30, 15, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]  # 中段+臨場（分鐘）
-    # 早段：由開賣到 -60分，每 120 分鐘一格（實際時間顯示）
-    early_edges = []
-    if post_ts is not None:
-        # 由 -60分 再往早，每 120 分一格，去到「有記錄嘅最早時間」
-        earliest = S["stake_hist"] and min(
-            (h[0][0] for h in S["stake_hist"].values() if h), default=now_ts)
-        earliest_min_before = (post_ts - earliest) / 60.0 if earliest else 60
-        e = 180
-        while e <= earliest_min_before + 120 and e <= 24 * 60:
-            early_edges.append(e)
-            e += 120
-        early_edges = sorted(set(early_edges), reverse=True)  # 大到細（早到遲）
-
-    # 完整 edge 序列（早 -> 遲）：early(大) ... 60,30,...,0
-    all_edges = early_edges + minute_edges  # e.g. [ ...300,180, 60,30,15,10,9..0 ]
+    post_dt_local = S["post_time"] if S["post_time"] else None
 
     def edge_ts(min_before):
         return post_ts - min_before * 60 if post_ts is not None else None
 
-    def label_for(min_before, is_first_early):
-        if min_before <= 0:
-            return ("開跑", False, False)
-        if min_before in (60, 30, 15, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1):
-            return (f"-{min_before}分", False, False)
-        # 早段：用實際時間
-        ts = edge_ts(min_before)
-        dt = datetime.fromtimestamp(ts, HKT)
-        hhmm = dt.strftime("%H:%M")
-        # 「昨」= 唔同開跑日
-        post_dt = datetime.fromtimestamp(post_ts, HKT)
-        is_prev = dt.date() < post_dt.date()
-        return (hhmm, True, is_prev)
+    # 當日 00:00（固定，唔跟開跑時間浮動）
+    midnight_dt = datetime(post_dt_local.year, post_dt_local.month, post_dt_local.day,
+                           0, 0, 0, tzinfo=HKT) if post_dt_local else None
+    midnight_ts = midnight_dt.timestamp() if midnight_dt else None
 
-    # 方案C（#6）：早段（開賣→60分前）預設摺埋一格；剔「展開早段」先細分。
-    show_early = st.session_state.get(f"early_open_{pool}", False)
-
-    # columns = each bucket between consecutive edges (start=older, end=newer)
-    cols = []   # list of (label, is_hour, is_prev, ts_start, ts_end)
-    if show_early:
-        # 展開：早段逐格（實際時間）+ 臨場
-        prev_edge = None
-        for idx, mb in enumerate(all_edges):
-            e_end = edge_ts(mb)
-            e_start = None if prev_edge is None else edge_ts(prev_edge)
-            lbl, is_hour, is_prev = label_for(mb, idx == 0)
-            cols.append((lbl, is_hour, is_prev, e_start, e_end))
-            prev_edge = mb
-    else:
-        # 摺埋：早段一格（由最早 → -60分），之後臨場逐格
-        cols.append(("開賣→60分前", True, False, None, edge_ts(60)))
-        prev_edge = 60
-        for mb in minute_edges:
-            if mb >= 60:
-                continue
-            e_end = edge_ts(mb)
-            e_start = edge_ts(prev_edge)
-            lbl, is_hour, is_prev = label_for(mb, False)
-            cols.append((lbl, is_hour, is_prev, e_start, e_end))
-            prev_edge = mb
+    # 逐格定義：(label, is_hour[早段/整點格,唔變色], ts_start, ts_end)
+    # 60/30/20/10：呢格代表「由呢個分鐘數開始，去到下一個刻度」嘅一段流入
+    #（例如「60」= 開跑前60分鐘 → 開跑前30分鐘 呢段）。10之後逐分鐘去到開跑。
+    ladder = [60, 30, 20, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+    cols = [
+        ("隔夜", True, False, None, midnight_ts),
+        ("當日", True, False, midnight_ts, edge_ts(60)),
+    ]
+    for i in range(len(ladder) - 1):
+        start_e, end_e = ladder[i], ladder[i + 1]
+        lbl = "開跑" if end_e == 0 else str(start_e)
+        is_hour = start_e >= 60   # 60呢格仲係大格,唔變色；30/20/10之後嘅逐分鐘格先變色
+        cols.append((lbl, is_hour, False, edge_ts(start_e), edge_ts(end_e)))
 
     def stake_bucket(horse, ts_start, ts_end):
         if ts_end is None:
@@ -1535,7 +1509,7 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
         if v is None:
             return "var(--muted)"
         if is_hour:
-            return "var(--subtext)"   # 早段唔變色
+            return "var(--subtext)"   # 早段/大格唔變色
         if v >= m3: return "#c878ff"
         if v >= m2: return "#ff8c3c"
         if v >= m1: return "#ffd43b"
@@ -1544,10 +1518,9 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
     # header
     head = '<th style="text-align:left;padding:3px 5px;font-size:9px;color:var(--muted);position:sticky;left:0;background:var(--card)">馬 賠</th>'
     for (lbl, is_hour, is_prev, _, _) in cols:
-        prev_tag = '<div style="font-size:7px;color:#78899a;line-height:1">昨</div>' if is_prev else ''
         col_bg = "background:rgba(30,30,44,0.5);" if is_hour else ""
         head += (f'<th style="text-align:right;padding:2px 5px;font-size:9px;color:{"#78899a" if is_hour else "var(--muted)"};{col_bg}">'
-                 f'{prev_tag}{lbl}</th>')
+                 f'{lbl}</th>')
     head += '<th style="text-align:right;padding:3px 5px;font-size:9px;color:#e0a83c">合計</th>'
 
     body = ""
@@ -1573,8 +1546,9 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
     html = (
         f'<div class="panel" style="overflow-x:auto">'
         f'<div class="panel-title">📋 落注金額表（{title} · 時間由左到右）</div>'
-        f'<div class="panel-sub">每格＝嗰段流入 · 早段(左·實際時間+昨) → 開跑(最右) · '
-        f'臨場逐分鐘 ⚡{_fmt_money(m1)}黃/🔥{_fmt_money(m2)}橙/💥{_fmt_money(m3)}紫（只臨場格變色）· 合計＝總投注（同棒型圖）</div>'
+        f'<div class="panel-sub">隔夜(開賣→00:00) · 當日(00:00→-60分,全場一致) · '
+        f'60/30/20/10(每段) · 10分之後逐分鐘 → 開跑 · '
+        f'⚡{_fmt_money(m1)}黃/🔥{_fmt_money(m2)}橙/💥{_fmt_money(m3)}紫（只臨場逐分鐘格變色）· 合計＝總投注（同棒型圖）</div>'
         f'<table style="border-collapse:collapse;width:100%">'
         f'<tr>{head}</tr>{body}</table>'
         f'</div>'
@@ -1788,47 +1762,49 @@ def four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
 def signal_summary_panel(events, minutes=30, as_of_ts=None):
     """30分鐘訊號彙總（右邊新面板）：按馬分組，撳開睇逐行時序細節。
     events: list of {ts,horse,pool,tier,rise}。as_of_ts=None 用而家時間；
-    REPLAY 模式會傳返嗰個snapshot嘅ts，等個30分鐘窗跟返翻睇緊嗰一刻。"""
+    REPLAY 模式會傳返嗰個snapshot嘅ts，等個30分鐘窗跟返翻睇緊嗰一刻。
+    用 st.container(border=True) 包住成個panel（連暫無訊號都喺border入面），
+    等個box可以自動stretch去到同左邊「四池綜合熱度」一樣高（CSS喺別處控制）。"""
     if as_of_ts is None:
         as_of_ts = datetime.now(HKT).timestamp()
     cutoff = as_of_ts - minutes * 60
     evs_in_window = [e for e in events if cutoff <= e.get("ts", 0) <= as_of_ts]
 
-    st.markdown(
-        f'<div class="panel">'
-        f'<div class="panel-title">🕐 {minutes}分鐘訊號彙總</div>'
-        f'<div class="panel-sub">按馬分組 · 撳隻馬展開時序細節 · 過咗{minutes}分鐘自動移除</div>'
-        f'</div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown(
+            f'<div class="panel-title">🕐 {minutes}分鐘訊號彙總</div>'
+            f'<div class="panel-sub">按馬分組 · 撳隻馬展開時序細節 · 過咗{minutes}分鐘自動移除</div>',
+            unsafe_allow_html=True)
 
-    if not evs_in_window:
-        st.caption("暫無訊號")
-        return
+        if not evs_in_window:
+            st.caption("暫無訊號")
+            return
 
-    by_horse = defaultdict(list)
-    for e in evs_in_window:
-        by_horse[e["horse"]].append(e)
+        by_horse = defaultdict(list)
+        for e in evs_in_window:
+            by_horse[e["horse"]].append(e)
 
-    tier_emoji = {1: "⚡", 2: "🔥", 3: "💥"}
+        tier_emoji = {1: "⚡", 2: "🔥", 3: "💥"}
 
-    def horse_key(h):
-        evs = by_horse[h]
-        return (-max(ev["tier"] for ev in evs), -max(ev["ts"] for ev in evs))
+        def horse_key(h):
+            evs = by_horse[h]
+            return (-max(ev["tier"] for ev in evs), -max(ev["ts"] for ev in evs))
 
-    for h in sorted(by_horse.keys(), key=horse_key):
-        evs = sorted(by_horse[h], key=lambda e: e["ts"], reverse=True)
-        counts = {1: 0, 2: 0, 3: 0}
-        for e in evs:
-            counts[e["tier"]] = counts.get(e["tier"], 0) + 1
-        summary = "　".join(f'{tier_emoji[t]}×{counts[t]}' for t in (3, 2, 1) if counts.get(t))
-        with st.expander(f"{h}號　{summary}", expanded=False):
+        for h in sorted(by_horse.keys(), key=horse_key):
+            evs = sorted(by_horse[h], key=lambda e: e["ts"], reverse=True)
+            counts = {1: 0, 2: 0, 3: 0}
             for e in evs:
-                t_str = datetime.fromtimestamp(e["ts"], HKT).strftime("%H:%M:%S")
-                st.markdown(
-                    f'<div style="display:flex;gap:8px;font-size:11px;padding:2px 0">'
-                    f'<span style="color:var(--muted);width:56px">{t_str}</span>'
-                    f'<span style="color:var(--subtext);width:36px">{e["pool"]}</span>'
-                    f'<span style="color:var(--text)">{tier_emoji.get(e["tier"], "")} +{e["rise"]:.1f}%</span>'
-                    f'</div>', unsafe_allow_html=True)
+                counts[e["tier"]] = counts.get(e["tier"], 0) + 1
+            summary = "　".join(f'{tier_emoji[t]}×{counts[t]}' for t in (3, 2, 1) if counts.get(t))
+            with st.expander(f"{h}號　{summary}", expanded=False):
+                for e in evs:
+                    t_str = datetime.fromtimestamp(e["ts"], HKT).strftime("%H:%M:%S")
+                    st.markdown(
+                        f'<div style="display:flex;gap:8px;font-size:11px;padding:2px 0">'
+                        f'<span style="color:var(--muted);width:56px">{t_str}</span>'
+                        f'<span style="color:var(--subtext);width:36px">{e["pool"]}</span>'
+                        f'<span style="color:var(--text)">{tier_emoji.get(e["tier"], "")} +{e["rise"]:.1f}%</span>'
+                        f'</div>', unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════════
 #  HEADER + CONTROLS
@@ -2336,18 +2312,19 @@ else:
     pool_totals = {"WIN": win_inv, "PLA": pla_inv,
                    "QIN": this_inv.get("QIN"), "QPL": this_inv.get("QPL")}
     rise_thresh = st.session_state.get("rise_thresh", 0.5)
-    hcol1, hcol2 = st.columns([1.3, 1])
-    with hcol1:
-        four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
-                             pool_totals, cold_odds=10.0, rise_thresh=rise_thresh)
-    with hcol2:
-        if replay_mode and replay_snaps and replay_idx is not None:
-            _sig_events = load_signal_log(race_key, 0.0)
-            _sig_as_of = replay_snaps[replay_idx]["ts"]
-        else:
-            _sig_events = list(S["signal_log"])
-            _sig_as_of = None
-        signal_summary_panel(_sig_events, minutes=30, as_of_ts=_sig_as_of)
+    with st.container(key="heat_signal_row"):
+        hcol1, hcol2 = st.columns([1.3, 1])
+        with hcol1:
+            four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
+                                 pool_totals, cold_odds=10.0, rise_thresh=rise_thresh)
+        with hcol2:
+            if replay_mode and replay_snaps and replay_idx is not None:
+                _sig_events = load_signal_log(race_key, 0.0)
+                _sig_as_of = replay_snaps[replay_idx]["ts"]
+            else:
+                _sig_events = list(S["signal_log"])
+                _sig_as_of = None
+            signal_summary_panel(_sig_events, minutes=30, as_of_ts=_sig_as_of)
 
     # ═══ ④ 投注額棒型圖（直向）═══
     _m1 = st.session_state.get("money_t1", MONEY_TIER1)
@@ -2364,14 +2341,7 @@ else:
         stake_bar_chart_v(df[df["池"] == "PLA"], "位置", pla_inv, S,
                           sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp)
 
-    # ═══ ⑤ 每分鐘落注金額表（獨贏 / 位置）═══
-    ec1, ec2 = st.columns(2)
-    with ec1:
-        st.session_state["early_open_WIN"] = st.checkbox(
-            "獨贏：展開早段細分", value=st.session_state.get("early_open_WIN", False))
-    with ec2:
-        st.session_state["early_open_PLA"] = st.checkbox(
-            "位置：展開早段細分", value=st.session_state.get("early_open_PLA", False))
+    # ═══ ⑤ 落注金額表（獨贏 / 位置）═══
     minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", m1=_m1, m2=_m2, m3=_m3)
     minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="PLA", m1=_m1, m2=_m2, m3=_m3)
 
