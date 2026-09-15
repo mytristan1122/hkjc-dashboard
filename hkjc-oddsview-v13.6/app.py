@@ -10,7 +10,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.8 STHV"
+APP_VERSION = "v17.9 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -827,6 +827,71 @@ def current_stake(S, pool_name, horse):
     hist = S["stake_hist"][(pool_name, str(horse))]
     return hist[-1][1] if hist else None
 
+def stake_at_ts_disk(snaps, pool_name, horse, target_ts):
+    """由硬碟 snapshot（已按時間排序，冇上限）重建該馬喺 target_ts 嗰刻嘅
+    累積投注額。同 stake_at_ts() 邏輯一樣（佔比法），分別係呢個唔受記憶體
+    deque 嘅 maxlen 限制 —— 開賣提前幾多個鐘、甚至跨日都計得到。"""
+    if target_ts is None:
+        return None
+    best = None
+    for sp in snaps:
+        ts = sp.get("ts")
+        if ts is None or ts > target_ts:
+            continue
+        odds_map = sp.get("win") if pool_name == "WIN" else sp.get("pla")
+        if not odds_map:
+            continue
+        o = odds_map.get(str(horse))
+        if o is None:
+            continue
+        try:
+            o = float(o)
+        except Exception:
+            continue
+        if o <= 0:
+            continue
+        try:
+            inv_sum = sum(1.0 / float(v) for v in odds_map.values() if float(v) > 0)
+        except Exception:
+            inv_sum = 0.0
+        ptot = (sp.get("pool") or {}).get(pool_name)
+        if not ptot or inv_sum <= 0:
+            continue
+        best = (1.0 / o) / inv_sum * ptot
+    return best
+
+def compute_early_buckets_from_disk(race_key, pool_name, horses, midnight_ts, edge60_ts, ttl=60):
+    """「隔夜」「當日」直接由硬碟 snapshot 計，解決開賣提前超過24小時、記憶體
+    deque 裝唔晒嘅問題。用 session_state cache 住結果，每 ttl 秒（預設60）先
+    真正重新掃一次硬碟；中間嘅5秒refresh就直接攞返cache嘅數，唔會拖慢畫面，
+    亦唔會拖硬碟IO。"""
+    cache_key = f"_early_buckets_{race_key}_{pool_name}"
+    ts_key = cache_key + "_ts"
+    now = datetime.now(HKT).timestamp()
+    last = st.session_state.get(ts_key, 0.0)
+    if cache_key in st.session_state and (now - last) < ttl:
+        return st.session_state[cache_key]
+    result = {}
+    if midnight_ts is not None and edge60_ts is not None:
+        try:
+            snaps = load_snapshots(race_key)
+        except Exception:
+            snaps = []
+        if snaps:
+            for h in horses:
+                h = str(h)
+                # 彩池打從開賣就係由 $0 開始累積，所以 stake_at_ts_disk() 直接
+                # 攞返嘅係「絕對值」，唔使再減走「第一個snapshot」做基準
+                # （減咗反而會漏走開賣到第一個snapshot呢一小段，令合計對唔上）。
+                v_mid = stake_at_ts_disk(snaps, pool_name, h, midnight_ts)
+                v_60 = stake_at_ts_disk(snaps, pool_name, h, edge60_ts)
+                overnight = v_mid if v_mid is not None else None
+                today = (v_60 - v_mid) if (v_60 is not None and v_mid is not None) else None
+                result[h] = {"隔夜": overnight, "當日": today}
+    st.session_state[cache_key] = result
+    st.session_state[ts_key] = now
+    return result
+
 # ════════════════════════════════════════════════════════════
 #  RENDER HELPERS
 # ════════════════════════════════════════════════════════════
@@ -1517,11 +1582,20 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
             return s_end - s_start
         return stake_in_bucket(S, pool, horse, ts_start, ts_end)
 
+    # 「隔夜」「當日」由硬碟計（唔受記憶體deque上限影響，開賣提前幾耐都啱）；
+    # 60/30/20/10同逐分鐘就用返記憶體（夠近，唔使拖硬碟）。
+    race_key_now = S.get("race_key")
+    early_map = (compute_early_buckets_from_disk(
+        race_key_now, pool, list(sub["馬號"]), midnight_ts, edge_ts(60))
+        if race_key_now else {})
+
     rows_data = []
     for _, r in sub.sort_values("即場").iterrows():
         horse = str(r["馬號"])
         odds = r["即場"]
-        per_col = [stake_bucket(horse, s, e) for (_, _, _, s, e) in cols]
+        eb = early_map.get(horse, {})
+        per_col = [eb.get("隔夜"), eb.get("當日")]
+        per_col += [stake_bucket(horse, s, e) for (_, _, _, s, e) in cols[2:]]
         rows_data.append((horse, odds, per_col))
 
     def cellcol(v, is_hour):
