@@ -10,7 +10,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.7 STHV"
+APP_VERSION = "v17.8 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -134,6 +134,26 @@ def sync_state_from_disk(race_key, S):
                     S["stake_hist"][key].append((ts, share * ptot))
                     S["share_hist"][(pool_code, str(h))].append((ts, share * 100.0))
     S["_disk_synced_ts"] = max_ts
+
+    # ── 修正時間順序 ──
+    # sync補歷史嗰陣，硬碟舊記錄可能加喺記憶體新記錄之後，令次序唔再
+    # 遞增。落注金額表逐格計算靠時間順序搵邊界，次序亂咗就會計錯。
+    # 呢度統一按時間戳(ts)重新排返：唔刪、唔加任何一個記錄點，淨係sort。
+    for store in (S["series"], S["stake_hist"]):
+        for key in list(store.keys()):
+            dq = store[key]
+            if len(dq) < 2:
+                continue
+            sorted_pts = sorted(dq, key=lambda p: p[0])
+            dq.clear()
+            dq.extend(sorted_pts)
+    for key in list(S["share_hist"].keys()):
+        dq = S["share_hist"][key]
+        if len(dq) < 2:
+            continue
+        sorted_pts = sorted(dq, key=lambda p: p[0])
+        dq.clear()
+        dq.extend(sorted_pts)
 
 def _signal_log_path(race_key):
     return os.path.join(_race_dir(race_key), "signals.jsonl")
