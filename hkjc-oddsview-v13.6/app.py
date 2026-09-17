@@ -1,3 +1,4 @@
+
 import streamlit as st
 import requests
 import time as _time
@@ -10,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.9 STHV"
+APP_VERSION = "v17.11 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -55,6 +56,22 @@ def list_saved_races():
     except Exception:
         return []
 
+def _nearest_snap_idx(snaps, target_ts):
+    """喺已排序嘅snapshot list入面，搵時間戳最接近target_ts嗰個index。
+    俾REPLAY快捷跳點chip用（例如撳「-30分」就跳去最接近嗰個記錄點）。"""
+    if not snaps or target_ts is None:
+        return None
+    best_i, best_diff = 0, None
+    for i, sp in enumerate(snaps):
+        ts = sp.get("ts")
+        if ts is None:
+            continue
+        d = abs(ts - target_ts)
+        if best_diff is None or d < best_diff:
+            best_diff = d
+            best_i = i
+    return best_i
+
 def load_snapshots(race_key):
     """Load all snapshots for a race, sorted by ts. Returns list of dicts."""
     try:
@@ -70,6 +87,27 @@ def load_snapshots(race_key):
         return snaps
     except Exception:
         return []
+
+def _settings_path():
+    return os.path.join(DATA_DIR, "_settings.json")
+
+def load_settings():
+    """讀返上次「儲存設定」寫低嘅敏感度數值。有問題就返回空dict（用返程式預設值）。"""
+    try:
+        with open(_settings_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_settings(settings):
+    """將敏感度設定寫落硬碟，下次開app/restart都會自動讀返，唔使成日調。"""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(_settings_path(), "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
 
 def load_latest_snapshot(race_key):
     """讀該場最新一個 snapshot（LIVE 讀硬碟用，快、唔使拉 HKJC）。"""
@@ -198,6 +236,124 @@ def sync_signal_log_from_disk(race_key, S):
     for ev in new_events:
         S["signal_log"].append(ev)
         S["_signal_log_synced_ts"] = max(S.get("_signal_log_synced_ts", 0.0), ev.get("ts", 0.0))
+
+def backfill_signals_from_disk(race_key):
+    """REPLAY揀到一場之前完全未 live 睇過（即係 signals.jsonl 仲未存在）嘅場，
+    就用硬碟完整 snapshot 歷史，事後補跑一次⚡🔥💥偵測邏輯（WIN/PLA/QIN/QPL
+    四個池），寫返落 signals.jsonl。呢個係一次性運算，計完就cache喺硬碟，
+    下次再揀返呢場（LIVE或REPLAY）都唔使重計。"""
+    try:
+        snaps = load_snapshots(race_key)
+    except Exception:
+        snaps = []
+    # 就算冇snapshot都要建立返個（空）file，等佢做「已經處理過」嘅標記，
+    # 唔會下次又再嚟一次。
+    if not snaps:
+        try:
+            os.makedirs(_race_dir(race_key), exist_ok=True)
+            with open(_signal_log_path(race_key), "w", encoding="utf-8") as f:
+                pass
+        except Exception:
+            pass
+        return
+
+    share_hist = defaultdict(list)   # (pool,horse) -> [(ts, share%)]
+    last_tier = {}
+    last_ts_logged = {}
+    events = []
+    t1, t2, t3 = RISE_TIER1, RISE_TIER2, RISE_TIER3   # 用返系統預設門檻（補歷史，唔跟user而家自訂嘅）
+
+    for sp in snaps:
+        ts = sp.get("ts")
+        if ts is None:
+            continue
+
+        for pool_code, snap_key in (("WIN", "win"), ("PLA", "pla")):
+            odds_map = sp.get(snap_key) or {}
+            if not odds_map:
+                continue
+            try:
+                inv_sum = sum(1.0 / float(o) for o in odds_map.values() if float(o) > 0)
+            except Exception:
+                inv_sum = 0.0
+            if inv_sum <= 0:
+                continue
+            for h, o in odds_map.items():
+                try:
+                    o = float(o)
+                except Exception:
+                    continue
+                if o <= 0:
+                    continue
+                share = (1.0 / o) / inv_sum * 100.0
+                share_hist[(pool_code, str(h))].append((ts, share))
+
+        for pool_code, snap_key in (("QIN", "qin"), ("QPL", "qpl")):
+            raw = sp.get(snap_key) or {}
+            if not raw:
+                continue
+            matrix = {}
+            for k, o in raw.items():
+                try:
+                    a_str, b_str = k.split(",")
+                    a, b = int(a_str), int(b_str)
+                    o = float(o)
+                except Exception:
+                    continue
+                if o <= 0:
+                    continue
+                matrix[(a, b)] = o
+            part = combo_participation(matrix)
+            for h, pct in part.items():
+                share_hist[(pool_code, str(h))].append((ts, pct))
+
+        all_horses = set(h for (_p, h) in share_hist.keys())
+        for h in all_horses:
+            rises = {}
+            for pool_code in ("WIN", "PLA", "QIN", "QPL"):
+                hist = share_hist.get((pool_code, h))
+                if not hist or len(hist) < 2:
+                    rises[pool_code] = 0.0
+                    continue
+                last_pt_ts, last_pt_v = hist[-1]
+                cutoff = last_pt_ts - 60
+                base_v = None
+                for hts, hv in hist:
+                    if hts <= cutoff:
+                        base_v = hv
+                if base_v is None:
+                    base_v = hist[0][1]
+                rises[pool_code] = last_pt_v - base_v
+            max_rise = max(rises.values()) if rises else 0.0
+            if max_rise >= t3:
+                tier = 3
+            elif max_rise >= t2:
+                tier = 2
+            elif max_rise >= t1:
+                tier = 1
+            else:
+                tier = 0
+            prev_tier = last_tier.get(h, 0)
+            should_log = False
+            if tier > 0:
+                if tier > prev_tier or (ts - last_ts_logged.get(h, 0)) >= 60:
+                    should_log = True
+            if should_log:
+                cause_pool = max(rises, key=rises.get)
+                events.append({"ts": ts, "horse": h, "pool": cause_pool,
+                               "tier": tier, "rise": round(max_rise, 2)})
+                last_tier[h] = tier
+                last_ts_logged[h] = ts
+            elif tier == 0:
+                last_tier[h] = 0
+
+    try:
+        os.makedirs(_race_dir(race_key), exist_ok=True)
+        with open(_signal_log_path(race_key), "w", encoding="utf-8") as f:
+            for ev in events:
+                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 # ════════════════════════════════════════════════════════════
 #  CONFIG / CONSTANTS
@@ -421,6 +577,12 @@ def _blank_state():
 # each race accumulates independently and is remembered.
 if "RACES" not in st.session_state:
     st.session_state.RACES = {}
+
+# 開機讀一次硬碟settings（如果之前撳過「儲存設定」），補做預設值。
+if "_settings_loaded" not in st.session_state:
+    for _k, _v in (load_settings() or {}).items():
+        st.session_state.setdefault(_k, _v)
+    st.session_state["_settings_loaded"] = True
 
 def get_state(race_key):
     if race_key not in st.session_state.RACES:
@@ -1907,6 +2069,21 @@ st.markdown(
     f'<span class="live"><span class="live-dot"></span>實時 · 5秒</span></div>',
     unsafe_allow_html=True)
 
+# ── 資料來源 + 模式：合併一列，置頂（決定成個畫面點運作嘅最頂層開關）──
+st.markdown('<div style="font-size:12px;color:var(--subtext);margin:4px 0 2px">📡 資料來源　　　⏱️ 模式</div>',
+            unsafe_allow_html=True)
+_src_col, _sep_col, _mode_col = st.columns([2.4, 0.1, 2])
+with _src_col:
+    data_src = st.radio("資料來源", ["💾 雲端記錄（讀硬碟·快）", "🌐 直接連線（拉HKJC）"],
+                        horizontal=True, label_visibility="collapsed", key="data_src")
+    use_disk = "雲端" in data_src
+with _mode_col:
+    mode = st.radio("模式", ["● LIVE 即場", "🔁 REPLAY 翻睇"], horizontal=True,
+                    label_visibility="collapsed", key="mode_toggle")
+replay_mode = "REPLAY" in mode
+replay_snaps = None
+replay_idx = None
+
 # ── #8：自動同步馬會賽期（列出所有有賽事嘅日期+場地，包括海外）──
 if "meetings_cache" not in st.session_state:
     st.session_state.meetings_cache = []
@@ -1974,62 +2151,60 @@ with st.expander("⚙️ 急升偵測敏感度（分層 · 拉桿微調）"):
     with sc3:
         st.session_state["rise_t3"] = st.slider(
             "💥 強烈（%）", 0.5, 3.0, st.session_state.get("rise_t3", RISE_TIER3), 0.1)
-    st.markdown('<div style="font-size:11px;color:var(--subtext);margin:8px 0 2px">金額訊號（棒型圖 + 每分鐘金額表）· 千元</div>', unsafe_allow_html=True)
-    mc1, mc2, mc3 = st.columns(3)
+
+    st.markdown('<div style="font-size:11px;color:var(--subtext);margin:8px 0 2px">金額訊號（棒型圖 + 每分鐘金額表）· 千元（輸入數值，撳「儲存設定」先會跨session記住）</div>', unsafe_allow_html=True)
+    mc1, mc2, mc3, mc4 = st.columns([1, 1, 1, 0.9])
     with mc1:
-        _mk1 = st.slider("⚡ 留意（$K）", 20, 500,
-                         st.session_state.get("money_t1_k", MONEY_TIER1 // 1000), 10)
-        st.session_state["money_t1_k"] = _mk1
-        st.session_state["money_t1"] = _mk1 * 1000
+        _mk1 = st.number_input("⚡ 留意（1-50 K）", min_value=1, max_value=50, step=1,
+                               value=int(st.session_state.get("money_t1_k", MONEY_TIER1 // 1000)))
     with mc2:
-        _mk2 = st.slider("🔥 明顯（$K）", 50, 800,
-                         st.session_state.get("money_t2_k", MONEY_TIER2 // 1000), 10)
-        st.session_state["money_t2_k"] = _mk2
-        st.session_state["money_t2"] = _mk2 * 1000
+        _mk2 = st.number_input("🔥 明顯（51-100 K）", min_value=51, max_value=100, step=1,
+                               value=int(st.session_state.get("money_t2_k", 70)))
     with mc3:
-        _mk3 = st.slider("💥 強烈（$K）", 100, 1500,
-                         st.session_state.get("money_t3_k", MONEY_TIER3 // 1000), 50)
-        st.session_state["money_t3_k"] = _mk3
-        st.session_state["money_t3"] = _mk3 * 1000
+        _mk3 = st.number_input("💥 強烈（101-400 K）", min_value=101, max_value=400, step=1,
+                               value=int(st.session_state.get("money_t3_k", 150)))
+    with mc4:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if st.button("💾 儲存設定", use_container_width=True):
+            _ok = save_settings({
+                "money_t1_k": _mk1, "money_t2_k": _mk2, "money_t3_k": _mk3,
+                "rise_t1": st.session_state.get("rise_t1", RISE_TIER1),
+                "rise_t2": st.session_state.get("rise_t2", RISE_TIER2),
+                "rise_t3": st.session_state.get("rise_t3", RISE_TIER3),
+            })
+            st.session_state["_settings_saved_at"] = datetime.now(HKT).strftime("%H:%M:%S")
+            st.session_state["_settings_save_ok"] = _ok
+
+    # 呢3個數值即刻生效（唔使撳儲存都會即場用到），儲存淨係影響「下次開app」嘅預設值
+    st.session_state["money_t1_k"] = _mk1
+    st.session_state["money_t2_k"] = _mk2
+    st.session_state["money_t3_k"] = _mk3
+    st.session_state["money_t1"] = _mk1 * 1000
+    st.session_state["money_t2"] = _mk2 * 1000
+    st.session_state["money_t3"] = _mk3 * 1000
+
+    if st.session_state.get("_settings_saved_at"):
+        _status = "已儲存" if st.session_state.get("_settings_save_ok") else "⚠️ 儲存失敗（check硬碟權限）"
+        st.caption(f"{_status}：{st.session_state['_settings_saved_at']}　· 下次開app會自動讀返呢啲數值")
+
     st.caption("四池熱度用佔比%；棒型圖+金額表用實質金額（近1分鐘實質落注），兩個金額表完美同步。低＝多提示、高＝少但精。")
 
-# ── 📡 資料來源：讀硬碟（recorder 記錄·快·自動開跑時間）定 直接連線（拉 HKJC）──
-st.markdown('<div style="font-size:12px;color:var(--subtext);margin:4px 0 2px">📡 資料來源</div>',
-            unsafe_allow_html=True)
-data_src = st.radio("資料來源", ["💾 雲端記錄（讀硬碟·快）", "🌐 直接連線（拉HKJC）"],
-                    horizontal=True, label_visibility="collapsed", key="data_src")
-use_disk = "雲端" in data_src
-
-# ── ⏱️ 翻睇控制（LIVE / REPLAY）— 直接顯示，唔收埋 ──
-replay_mode = False
-replay_snaps = None
-replay_idx = None
-st.markdown('<div style="font-size:12px;color:var(--subtext);margin:4px 0 2px">⏱️ 模式</div>',
-            unsafe_allow_html=True)
-mode = st.radio("模式", ["● LIVE 即場", "🔁 REPLAY 翻睇"], horizontal=True,
-                label_visibility="collapsed", key="mode_toggle")
-replay_mode = "REPLAY" in mode
 if replay_mode:
     saved = list_saved_races()
     if not saved:
         st.info("暫時未有已儲存嘅場次記錄。開住一場（有彩池數據）幾分鐘，佢會每 30 秒自動記低，之後就可以喺呢度揀返翻睇。")
     else:
-        rc1, rc2 = st.columns([1, 2])
-        with rc1:
-            pick = st.selectbox("揀場次", saved, index=len(saved) - 1)
+        pick = st.selectbox("揀場次", saved, index=len(saved) - 1)
         replay_snaps = load_snapshots(pick)
         if replay_snaps:
             n = len(replay_snaps)
-            def _lbl(i):
-                s = replay_snaps[i]
-                pt = s.get("post_time")
-                if pt:
-                    mtp = (s["ts"] - pt) / 60.0
-                    return f"開跑前 {abs(mtp):.0f} 分" if mtp < 0 else "開跑後"
-                return datetime.fromtimestamp(s["ts"], HKT).strftime("%H:%M:%S")
-            with rc2:
-                replay_idx = st.slider("時間軸（拉去任何一刻）", 0, n - 1, n - 1)
-            st.caption(f"時間點：{_lbl(replay_idx)}　（共 {n} 個記錄點，每 30 秒一個）")
+            # 時間軸滑桿本身（連同快捷跳點）搬咗去落面「棒型圖」上面先真正
+            # render；呢度淨係讀/初始化返個值，等成頁計算(df/mtp/stake_hist等)
+            # 用得到。用 session_state key 令個值可以「早讀、遲畫」。
+            if "replay_idx_slider" not in st.session_state:
+                st.session_state["replay_idx_slider"] = n - 1
+            st.session_state["replay_idx_slider"] = min(st.session_state["replay_idx_slider"], n - 1)
+            replay_idx = st.session_state["replay_idx_slider"]
         else:
             st.info("呢場冇記錄點")
 
@@ -2412,6 +2587,11 @@ else:
                                  pool_totals, cold_odds=10.0, rise_thresh=rise_thresh)
         with hcol2:
             if replay_mode and replay_snaps and replay_idx is not None:
+                try:
+                    if race_key and not os.path.isfile(_signal_log_path(race_key)):
+                        backfill_signals_from_disk(race_key)
+                except Exception:
+                    pass
                 _sig_events = load_signal_log(race_key, 0.0)
                 _sig_as_of = replay_snaps[replay_idx]["ts"]
             else:
@@ -2426,6 +2606,48 @@ else:
     bar_sort = st.radio("棒型圖排序", ["順馬號", "順賠率（熱→冷）"], horizontal=True,
                         label_visibility="collapsed", key="bar_sort")
     sort_key = "賠率" if "賠率" in bar_sort else "馬號"
+
+    # ── REPLAY 時間軸：快捷跳點 + 滑桿微調（擺喺排序之後、棒型圖之前）──
+    if replay_mode and replay_snaps:
+        _n_snaps = len(replay_snaps)
+        st.markdown('<div style="font-size:11px;color:var(--subtext);margin:4px 0 4px">⏱️ REPLAY 時間軸 · 快捷跳到</div>',
+                    unsafe_allow_html=True)
+        _chip_defs = [("隔夜起點", "start"), ("00:00", "midnight"), ("-60分", 60), ("-30分", 30),
+                     ("-20分", 20), ("-10分", 10), ("-5分", 5), ("-4分", 4), ("-3分", 3),
+                     ("-2分", 2), ("-1分", 1), ("開跑", "post")]
+        _chip_cols = st.columns(len(_chip_defs))
+        for (_clbl, _cval), _ccol in zip(_chip_defs, _chip_cols):
+            with _ccol:
+                if st.button(_clbl, key=f"chip_{_clbl}", use_container_width=True):
+                    _target_idx = None
+                    if _cval == "start":
+                        _target_idx = 0
+                    elif _cval == "post":
+                        _target_idx = _n_snaps - 1
+                    elif _cval == "midnight":
+                        if S.get("post_time"):
+                            _md = S["post_time"]
+                            _mts = datetime(_md.year, _md.month, _md.day, 0, 0, 0, tzinfo=HKT).timestamp()
+                            _target_idx = _nearest_snap_idx(replay_snaps, _mts)
+                    else:
+                        if S.get("post_time"):
+                            _tts = S["post_time"].timestamp() - _cval * 60
+                            _target_idx = _nearest_snap_idx(replay_snaps, _tts)
+                    if _target_idx is not None:
+                        st.session_state["replay_idx_slider"] = _target_idx
+                        st.rerun()
+
+        def _replay_lbl(i):
+            s = replay_snaps[i]
+            pt = s.get("post_time")
+            if pt:
+                _mtp = (s["ts"] - pt) / 60.0
+                return f"開跑前 {abs(_mtp):.0f} 分" if _mtp < 0 else "開跑後"
+            return datetime.fromtimestamp(s["ts"], HKT).strftime("%H:%M:%S")
+
+        replay_idx = st.slider("時間軸（拉去任何一刻，微調）", 0, _n_snaps - 1, key="replay_idx_slider")
+        st.caption(f"時間點：{_replay_lbl(replay_idx)}　（共 {_n_snaps} 個記錄點，每 30 秒一個）")
+
     bcol1, bcol2 = st.columns(2)
     with bcol1:
         stake_bar_chart_v(df[df["池"] == "WIN"], "獨贏", win_inv, S,
