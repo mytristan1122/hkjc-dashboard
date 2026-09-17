@@ -11,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.11 STHV"
+APP_VERSION = "v17.12 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -2140,29 +2140,51 @@ with c5:
 
 # 敏感度設定（可摺疊，唔阻主畫面）
 with st.expander("⚙️ 急升偵測敏感度（分層 · 拉桿微調）"):
+    def _clampf(v, lo, hi, fallback):
+        """同 _clamp 一樣，但處理浮點數（四池熱度用%）。"""
+        try:
+            v = float(v)
+        except Exception:
+            return fallback
+        return max(lo, min(hi, v))
+
     st.markdown('<div style="font-size:11px;color:var(--subtext);margin-bottom:2px">四池熱度（佔比 %）</div>', unsafe_allow_html=True)
     sc1, sc2, sc3 = st.columns(3)
     with sc1:
         st.session_state["rise_t1"] = st.slider(
-            "⚡ 留意（%）", 0.2, 2.0, st.session_state.get("rise_t1", RISE_TIER1), 0.1)
+            "⚡ 留意（%）", 0.2, 2.0,
+            _clampf(st.session_state.get("rise_t1", RISE_TIER1), 0.2, 2.0, RISE_TIER1), 0.1)
     with sc2:
         st.session_state["rise_t2"] = st.slider(
-            "🔥 明顯（%）", 0.3, 2.5, st.session_state.get("rise_t2", RISE_TIER2), 0.1)
+            "🔥 明顯（%）", 0.3, 2.5,
+            _clampf(st.session_state.get("rise_t2", RISE_TIER2), 0.3, 2.5, RISE_TIER2), 0.1)
     with sc3:
         st.session_state["rise_t3"] = st.slider(
-            "💥 強烈（%）", 0.5, 3.0, st.session_state.get("rise_t3", RISE_TIER3), 0.1)
+            "💥 強烈（%）", 0.5, 3.0,
+            _clampf(st.session_state.get("rise_t3", RISE_TIER3), 0.5, 3.0, RISE_TIER3), 0.1)
 
     st.markdown('<div style="font-size:11px;color:var(--subtext);margin:8px 0 2px">金額訊號（棒型圖 + 每分鐘金額表）· 千元（輸入數值，撳「儲存設定」先會跨session記住）</div>', unsafe_allow_html=True)
+
+    def _clamp(v, lo, hi, fallback):
+        """舊session_state / 舊settings檔可能存住超出新範圍嘅值（例如舊版拉桿
+        set過100K，但新⚡上限得50K），直接傳落 number_input 會令 Streamlit 拋
+        StreamlitValueAboveMaxError。呢度統一夾返入合法範圍先用。"""
+        try:
+            v = int(v)
+        except Exception:
+            return fallback
+        return max(lo, min(hi, v))
+
     mc1, mc2, mc3, mc4 = st.columns([1, 1, 1, 0.9])
     with mc1:
         _mk1 = st.number_input("⚡ 留意（1-50 K）", min_value=1, max_value=50, step=1,
-                               value=int(st.session_state.get("money_t1_k", MONEY_TIER1 // 1000)))
+                               value=_clamp(st.session_state.get("money_t1_k", 20), 1, 50, 20))
     with mc2:
         _mk2 = st.number_input("🔥 明顯（51-100 K）", min_value=51, max_value=100, step=1,
-                               value=int(st.session_state.get("money_t2_k", 70)))
+                               value=_clamp(st.session_state.get("money_t2_k", 70), 51, 100, 70))
     with mc3:
         _mk3 = st.number_input("💥 強烈（101-400 K）", min_value=101, max_value=400, step=1,
-                               value=int(st.session_state.get("money_t3_k", 150)))
+                               value=_clamp(st.session_state.get("money_t3_k", 150), 101, 400, 150))
     with mc4:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
         if st.button("💾 儲存設定", use_container_width=True):
