@@ -11,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.14 STHV"
+APP_VERSION = "v18.0 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -2241,12 +2241,42 @@ if replay_mode:
         else:
             st.info("呢場冇記錄點")
 
-# Get this race's own state (creates it if first visit; keeps existing on return)
-race_key = f"{race_date}|{course}|{race_no}"
-if reset_clicked:
-    S = reset_state(race_key)
+# ════════════════════════════════════════════════════════════
+#  ACTIVE CONTEXT — LIVE 同 REPLAY 各有自己一套，唔共用、唔互相污染
+# ════════════════════════════════════════════════════════════
+# 概念：成個 dashboard 只係一套顯示邏輯，由呢三個變數決定睇咩：
+#   ACTIVE_RACE_KEY  = 而家睇緊邊一場
+#   ACTIVE_POST_TIME = 嗰場嘅開跑時間
+#   ACTIVE_NOW_TS    = 睇緊邊一刻（LIVE＝而家；REPLAY＝時間軸揀嗰刻）
+# 落面所有 panel（棒型圖／落注表／四池熱度／訊號）一律用呢三個，
+# 唔再各自讀 S["race_key"] / S["post_time"]，亦唔再分 LIVE / REPLAY 寫兩套。
+LIVE_RACE_KEY = f"{race_date}|{course}|{race_no}"
+
+if replay_mode and replay_snaps:
+    # REPLAY 用自己一套 state（key 加前綴），行落去點改都唔會影響 LIVE 嗰場記憶
+    ACTIVE_RACE_KEY = st.session_state.get("_replay_pick") or LIVE_RACE_KEY
+    S = get_state("REPLAY::" + ACTIVE_RACE_KEY)
+    S["race_key"] = ACTIVE_RACE_KEY
+    # 開跑時間由 REPLAY 嗰場自己嘅 snapshot 攞（唔關上面選單事）
+    _rpt = None
+    for _sp in reversed(replay_snaps):
+        if _sp.get("post_time"):
+            _rpt = _sp["post_time"]
+            break
+    ACTIVE_POST_TIME = datetime.fromtimestamp(_rpt, HKT) if _rpt else None
+    ACTIVE_NOW_TS = (replay_snaps[replay_idx].get("ts")
+                     if replay_idx is not None and replay_idx < len(replay_snaps) else None)
 else:
-    S = get_state(race_key)
+    ACTIVE_RACE_KEY = LIVE_RACE_KEY
+    if reset_clicked:
+        S = reset_state(LIVE_RACE_KEY)
+    else:
+        S = get_state(LIVE_RACE_KEY)
+    ACTIVE_POST_TIME = None      # 下面由 manual_post / 硬碟 snapshot 決定
+    ACTIVE_NOW_TS = None         # None ＝ 用「而家」
+
+# 為咗兼容舊 code，race_key 繼續指住「而家睇緊嗰場」
+race_key = ACTIVE_RACE_KEY
 
 # 轉場次 / 重新揀返呢場之後，由硬碟補返記憶體漏咗嘅歷史（REPLAY 自己會
 # 由 snapshot 完整重建，唔使呢步；只在 LIVE 先做）。
@@ -2340,9 +2370,12 @@ qpl_matrix = combo_to_matrix(combo_pools, "QPL")
 qin_part = combo_participation(qin_matrix)
 qpl_part = combo_participation(qpl_matrix)
 
-# Post time: AUTO DISABLED (實時開跑時間唔穩定). Manual override only.
-# If manual is empty -> post_time None -> elapsed-time axis (no double-line risk).
-S["post_time"] = manual_post
+# Post time：REPLAY 已經喺 ACTIVE CONTEXT 由自己嗰場 snapshot 攞好；
+# LIVE 就用手動輸入（空＝下面讀硬碟時自動填）。手動輸入任何時候都最大。
+if replay_mode and ACTIVE_POST_TIME is not None:
+    S["post_time"] = manual_post or ACTIVE_POST_TIME
+else:
+    S["post_time"] = manual_post
 
 df = pools_to_df(pools)
 
@@ -2368,6 +2401,7 @@ if use_disk and not replay_mode:
         qpl_part = combo_participation(qpl_matrix)
         if _snap.get("post_time"):
             S["post_time"] = datetime.fromtimestamp(_snap["post_time"], HKT)  # 自動開跑時間
+            ACTIVE_POST_TIME = S["post_time"]
     else:
         st.info("💾 雲端記錄模式：呢場暫時未有記錄（recorder 開賣後會自動記）。想即刻睇可揀「🌐 直接連線」。")
 
@@ -2389,8 +2423,7 @@ if replay_mode and replay_snaps and replay_idx is not None:
     qpl_matrix = {tuple(int(x) for x in k.split(",")): v for k, v in (snap.get("qpl") or {}).items()}
     qin_part = combo_participation(qin_matrix)
     qpl_part = combo_participation(qpl_matrix)
-    if snap.get("post_time"):
-        S["post_time"] = datetime.fromtimestamp(snap["post_time"], HKT)
+    # post_time 已經喺 ACTIVE CONTEXT 由呢場自己嘅 snapshot 設定好，唔使再覆寫
 
 if df.empty:
     st.markdown(
@@ -2619,18 +2652,18 @@ else:
             four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
                                  pool_totals, cold_odds=10.0, rise_thresh=rise_thresh)
         with hcol2:
+            # 統一用 ACTIVE_RACE_KEY：REPLAY 讀返自己嗰場嘅 signals.jsonl，
+            # 唔會再寫／讀錯上面選單嗰場。
             if replay_mode and replay_snaps and replay_idx is not None:
                 try:
-                    if race_key and not os.path.isfile(_signal_log_path(race_key)):
-                        backfill_signals_from_disk(race_key)
+                    if ACTIVE_RACE_KEY and not os.path.isfile(_signal_log_path(ACTIVE_RACE_KEY)):
+                        backfill_signals_from_disk(ACTIVE_RACE_KEY)
                 except Exception:
                     pass
-                _sig_events = load_signal_log(race_key, 0.0)
-                _sig_as_of = replay_snaps[replay_idx]["ts"]
+                _sig_events = load_signal_log(ACTIVE_RACE_KEY, 0.0)
             else:
                 _sig_events = list(S["signal_log"])
-                _sig_as_of = None
-            signal_summary_panel(_sig_events, minutes=30, as_of_ts=_sig_as_of)
+            signal_summary_panel(_sig_events, minutes=30, as_of_ts=ACTIVE_NOW_TS)
 
     # ═══ ④ 投注額棒型圖（直向）═══
     _m1 = st.session_state.get("money_t1", MONEY_TIER1)
@@ -2658,20 +2691,24 @@ else:
             with _ccol:
                 if st.button(_clbl, key=f"chip_{_clbl}", use_container_width=True):
                     _target_idx = None
+                    # 用 ACTIVE_POST_TIME（＝REPLAY 揀嗰場自己嘅開跑時間），
+                    # 唔再讀 S["post_time"]（嗰個可能係上面選單另一場）。
+                    _pt = ACTIVE_POST_TIME
                     if _cval == "post":
                         _target_idx = _n_snaps - 1
-                    elif _cval == "midnight":
-                        if S.get("post_time"):
-                            _md = S["post_time"]
-                            _mts = datetime(_md.year, _md.month, _md.day, 0, 0, 0, tzinfo=HKT).timestamp()
+                    elif _pt is not None:
+                        if _cval == "midnight":
+                            _mts = datetime(_pt.year, _pt.month, _pt.day, 0, 0, 0,
+                                            tzinfo=HKT).timestamp()
                             _target_idx = _nearest_snap_idx(replay_snaps, _mts)
-                    else:
-                        if S.get("post_time"):
-                            _tts = S["post_time"].timestamp() - _cval * 60
+                        else:
+                            _tts = _pt.timestamp() - _cval * 60
                             _target_idx = _nearest_snap_idx(replay_snaps, _tts)
                     if _target_idx is not None:
                         st.session_state["replay_idx_slider"] = _target_idx
                         st.rerun()
+                    else:
+                        st.warning("呢場冇開跑時間記錄，跳唔到；可以用落面個滑桿微調。")
 
         def _replay_lbl(i):
             s = replay_snaps[i]
@@ -2693,18 +2730,12 @@ else:
                           sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp)
 
     # ═══ ⑤ 落注金額表（獨贏 / 位置）═══
-    # REPLAY：隔夜/當日要讀返「實際翻睇緊嗰場」嘅硬碟記錄（唔係上面下拉選單
-    # 揀嗰場），而且只計到時間軸揀咗嗰一刻，先會同其他欄同步。
-    if replay_mode and replay_snaps and replay_idx is not None:
-        _disk_key = st.session_state.get("_replay_pick")
-        _as_of = replay_snaps[replay_idx].get("ts")
-    else:
-        _disk_key = None
-        _as_of = None
+    # 統一用 ACTIVE 變數：睇邊場（ACTIVE_RACE_KEY）、睇邊一刻（ACTIVE_NOW_TS）。
+    # LIVE 同 REPLAY 行同一條 code，唔再分開兩套。
     minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", m1=_m1, m2=_m2, m3=_m3,
-                       disk_race_key=_disk_key, as_of_ts=_as_of)
+                       disk_race_key=ACTIVE_RACE_KEY, as_of_ts=ACTIVE_NOW_TS)
     minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="PLA", m1=_m1, m2=_m2, m3=_m3,
-                       disk_race_key=_disk_key, as_of_ts=_as_of)
+                       disk_race_key=ACTIVE_RACE_KEY, as_of_ts=ACTIVE_NOW_TS)
 
     # ── footer ──
     now_str = datetime.now(HKT).strftime("%H:%M:%S")
