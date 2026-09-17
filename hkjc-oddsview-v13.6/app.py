@@ -11,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.13 STHV"
+APP_VERSION = "v17.14 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -2643,19 +2643,22 @@ else:
     # ── REPLAY 時間軸：快捷跳點 + 滑桿微調（擺喺排序之後、棒型圖之前）──
     if replay_mode and replay_snaps:
         _n_snaps = len(replay_snaps)
-        st.markdown('<div style="font-size:11px;color:var(--subtext);margin:4px 0 4px">⏱️ REPLAY 時間軸 · 快捷跳到</div>',
+        st.markdown('<div style="font-size:11px;color:var(--subtext);margin:4px 0 4px">⏱️ REPLAY 時間軸 · 快捷跳到（撳邊個欄位＝跳去嗰段結束，該欄就顯示完整金額）</div>',
                     unsafe_allow_html=True)
-        _chip_defs = [("隔夜起點", "start"), ("00:00", "midnight"), ("-60分", 60), ("-30分", 30),
-                     ("-20分", 20), ("-10分", 10), ("-5分", 5), ("-4分", 4), ("-3分", 3),
-                     ("-2分", 2), ("-1分", 1), ("開跑", "post")]
+        # 15粒chip同落注表15個欄位一一對應。每粒跳去「該時段結束」嗰一刻：
+        #   隔夜 → 當日00:00 ／ 當日 → 開跑前60分 ／ 60 → 開跑前30分 ／ …
+        #   2 → 開跑前1分 ／ 開跑 → 最後一個記錄點
+        _chip_defs = [
+            ("隔夜", "midnight"), ("當日", 60), ("60", 30), ("30", 20), ("20", 10),
+            ("10", 9), ("9", 8), ("8", 7), ("7", 6), ("6", 5),
+            ("5", 4), ("4", 3), ("3", 2), ("2", 1), ("開跑", "post"),
+        ]
         _chip_cols = st.columns(len(_chip_defs))
         for (_clbl, _cval), _ccol in zip(_chip_defs, _chip_cols):
             with _ccol:
                 if st.button(_clbl, key=f"chip_{_clbl}", use_container_width=True):
                     _target_idx = None
-                    if _cval == "start":
-                        _target_idx = 0
-                    elif _cval == "post":
+                    if _cval == "post":
                         _target_idx = _n_snaps - 1
                     elif _cval == "midnight":
                         if S.get("post_time"):
