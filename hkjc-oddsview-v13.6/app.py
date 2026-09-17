@@ -11,7 +11,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v17.12 STHV"
+APP_VERSION = "v17.13 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -1022,12 +1022,16 @@ def stake_at_ts_disk(snaps, pool_name, horse, target_ts):
         best = (1.0 / o) / inv_sum * ptot
     return best
 
-def compute_early_buckets_from_disk(race_key, pool_name, horses, midnight_ts, edge60_ts, ttl=60):
+def compute_early_buckets_from_disk(race_key, pool_name, horses, midnight_ts, edge60_ts,
+                                    ttl=60, as_of_ts=None):
     """「隔夜」「當日」直接由硬碟 snapshot 計，解決開賣提前超過24小時、記憶體
     deque 裝唔晒嘅問題。用 session_state cache 住結果，每 ttl 秒（預設60）先
     真正重新掃一次硬碟；中間嘅5秒refresh就直接攞返cache嘅數，唔會拖慢畫面，
-    亦唔會拖硬碟IO。"""
-    cache_key = f"_early_buckets_{race_key}_{pool_name}"
+    亦唔會拖硬碟IO。
+
+    as_of_ts：只計到呢一刻為止（REPLAY 用，等「隔夜/當日」同其他欄一齊
+    停喺時間軸揀咗嗰一刻；LIVE 傳 None 就用晒所有記錄）。"""
+    cache_key = f"_early_buckets_{race_key}_{pool_name}_{int(as_of_ts) if as_of_ts else 'live'}"
     ts_key = cache_key + "_ts"
     now = datetime.now(HKT).timestamp()
     last = st.session_state.get(ts_key, 0.0)
@@ -1039,6 +1043,8 @@ def compute_early_buckets_from_disk(race_key, pool_name, horses, midnight_ts, ed
             snaps = load_snapshots(race_key)
         except Exception:
             snaps = []
+        if as_of_ts is not None:
+            snaps = [sp for sp in snaps if (sp.get("ts") or 0) <= as_of_ts]
         if snaps:
             for h in horses:
                 h = str(h)
@@ -1683,7 +1689,8 @@ def stake_bar_chart_v(df_pool, pool_name, pool_inv, S, sort_by="馬號",
     st.markdown(html, unsafe_allow_html=True)
 
 def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
-                       m1=100_000, m2=200_000, m3=400_000):
+                       m1=100_000, m2=200_000, m3=400_000,
+                       disk_race_key=None, as_of_ts=None):
     """Per-minute actual stake inflow table (Excel-style).
     Each row a horse, each column a countdown minute (-8..-1), cell = $ that
     flowed into that horse that minute. Uses stake = pool×0.825/odds reversal.
@@ -1746,9 +1753,12 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
 
     # 「隔夜」「當日」由硬碟計（唔受記憶體deque上限影響，開賣提前幾耐都啱）；
     # 60/30/20/10同逐分鐘就用返記憶體（夠近，唔使拖硬碟）。
-    race_key_now = S.get("race_key")
+    # disk_race_key：REPLAY 揀嗰場嘅 key（同上面下拉選單可能唔同場），
+    # 冇傳就用返 S 自己嗰個（LIVE 情況）。
+    race_key_now = disk_race_key or S.get("race_key")
     early_map = (compute_early_buckets_from_disk(
-        race_key_now, pool, list(sub["馬號"]), midnight_ts, edge_ts(60))
+        race_key_now, pool, list(sub["馬號"]), midnight_ts, edge_ts(60),
+        as_of_ts=as_of_ts)
         if race_key_now else {})
 
     rows_data = []
@@ -2217,6 +2227,7 @@ if replay_mode:
         st.info("暫時未有已儲存嘅場次記錄。開住一場（有彩池數據）幾分鐘，佢會每 30 秒自動記低，之後就可以喺呢度揀返翻睇。")
     else:
         pick = st.selectbox("揀場次", saved, index=len(saved) - 1)
+        st.session_state["_replay_pick"] = pick
         replay_snaps = load_snapshots(pick)
         if replay_snaps:
             n = len(replay_snaps)
@@ -2679,8 +2690,18 @@ else:
                           sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp)
 
     # ═══ ⑤ 落注金額表（獨贏 / 位置）═══
-    minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", m1=_m1, m2=_m2, m3=_m3)
-    minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="PLA", m1=_m1, m2=_m2, m3=_m3)
+    # REPLAY：隔夜/當日要讀返「實際翻睇緊嗰場」嘅硬碟記錄（唔係上面下拉選單
+    # 揀嗰場），而且只計到時間軸揀咗嗰一刻，先會同其他欄同步。
+    if replay_mode and replay_snaps and replay_idx is not None:
+        _disk_key = st.session_state.get("_replay_pick")
+        _as_of = replay_snaps[replay_idx].get("ts")
+    else:
+        _disk_key = None
+        _as_of = None
+    minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", m1=_m1, m2=_m2, m3=_m3,
+                       disk_race_key=_disk_key, as_of_ts=_as_of)
+    minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="PLA", m1=_m1, m2=_m2, m3=_m3,
+                       disk_race_key=_disk_key, as_of_ts=_as_of)
 
     # ── footer ──
     now_str = datetime.now(HKT).strftime("%H:%M:%S")
