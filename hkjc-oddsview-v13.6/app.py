@@ -1,4 +1,3 @@
-
 import streamlit as st
 import requests
 import time as _time
@@ -11,7 +10,7 @@ import os
 import json
 import glob
 
-APP_VERSION = "v18.0 STHV"
+APP_VERSION = "v18.2 STHV"
 APP_NAME = "HKJC 即時賠率監察"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -87,6 +86,40 @@ def load_snapshots(race_key):
         return snaps
     except Exception:
         return []
+
+def post_time_from_snaps(snaps):
+    """由一堆 snapshot 取「出現次數最多」嗰個 post_time（眾數）。
+
+    點解唔攞最新一個：recorder 每次拉 HKJC 攞到咩就寫咩，偶然會寫入異常值
+    （實測第1場：19:10 出現 4171 次先係正確，但最後一個 snapshot 寫住 19:00
+    只得 15 次，仲有 2 次 19:40）。取眾數就自動蓋過呢啲少數雜值。
+    LIVE（讀硬碟）同 REPLAY 都用呢一個 function，保證兩邊基準一致。"""
+    counts = {}
+    for sp in snaps or []:
+        p = sp.get("post_time")
+        if p:
+            counts[p] = counts.get(p, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+def post_time_for_race(race_key):
+    """攞某場嘅開跑時間（取眾數）。回傳 datetime 或 None。
+    有 cache（每 5 分鐘先真正掃一次硬碟），唔會每次 refresh 都讀成場。"""
+    ck = f"_posttime_{race_key}"
+    tk = ck + "_ts"
+    now = datetime.now(HKT).timestamp()
+    if ck in st.session_state and (now - st.session_state.get(tk, 0)) < 300:
+        return st.session_state[ck]
+    try:
+        snaps = load_snapshots(race_key)
+    except Exception:
+        snaps = []
+    p = post_time_from_snaps(snaps)
+    val = datetime.fromtimestamp(p, HKT) if p else None
+    st.session_state[ck] = val
+    st.session_state[tk] = now
+    return val
 
 def _settings_path():
     return os.path.join(DATA_DIR, "_settings.json")
@@ -2257,12 +2290,9 @@ if replay_mode and replay_snaps:
     ACTIVE_RACE_KEY = st.session_state.get("_replay_pick") or LIVE_RACE_KEY
     S = get_state("REPLAY::" + ACTIVE_RACE_KEY)
     S["race_key"] = ACTIVE_RACE_KEY
-    # 開跑時間由 REPLAY 嗰場自己嘅 snapshot 攞（唔關上面選單事）
-    _rpt = None
-    for _sp in reversed(replay_snaps):
-        if _sp.get("post_time"):
-            _rpt = _sp["post_time"]
-            break
+    # 開跑時間由 REPLAY 嗰場自己嘅 snapshot 取眾數（見 post_time_from_snaps
+    # 嘅註解：唔可以攞最後一個，recorder 偶然會寫入異常值）。
+    _rpt = post_time_from_snaps(replay_snaps)
     ACTIVE_POST_TIME = datetime.fromtimestamp(_rpt, HKT) if _rpt else None
     ACTIVE_NOW_TS = (replay_snaps[replay_idx].get("ts")
                      if replay_idx is not None and replay_idx < len(replay_snaps) else None)
@@ -2370,12 +2400,26 @@ qpl_matrix = combo_to_matrix(combo_pools, "QPL")
 qin_part = combo_participation(qin_matrix)
 qpl_part = combo_participation(qpl_matrix)
 
-# Post time：REPLAY 已經喺 ACTIVE CONTEXT 由自己嗰場 snapshot 攞好；
-# LIVE 就用手動輸入（空＝下面讀硬碟時自動填）。手動輸入任何時候都最大。
-if replay_mode and ACTIVE_POST_TIME is not None:
-    S["post_time"] = manual_post or ACTIVE_POST_TIME
+# ── Post time：LIVE 同 REPLAY 都自動攞，手動輸入任何時候都最大 ──
+# REPLAY：喺 ACTIVE CONTEXT 由嗰場 snapshot 取眾數攞好。
+# LIVE 讀硬碟：由嗰場所有 snapshot 取眾數（唔再攞最新一個，避免雜值）。
+# LIVE 直接連線：由 turnover API 嘅 postTime 攞（之前 AUTO DISABLED，
+#   而家開返；如果自動攞到嘅值唔啱，手動填就會蓋過佢）。
+_auto_post = None
+if replay_mode:
+    _auto_post = ACTIVE_POST_TIME
 else:
-    S["post_time"] = manual_post
+    if use_disk:
+        _auto_post = post_time_for_race(ACTIVE_RACE_KEY)
+    else:
+        _pt_raw = (turnover_map.get(int(race_no)) or {}).get("post")
+        _auto_post = parse_post_time(_pt_raw) if _pt_raw else None
+        # 直接連線攞唔到就退返去硬碟記錄（recorder 背景一直記緊）
+        if _auto_post is None:
+            _auto_post = post_time_for_race(ACTIVE_RACE_KEY)
+
+S["post_time"] = manual_post or _auto_post
+ACTIVE_POST_TIME = S["post_time"]
 
 df = pools_to_df(pools)
 
@@ -2399,9 +2443,7 @@ if use_disk and not replay_mode:
                       for k, v in (_snap.get("qpl") or {}).items()}
         qin_part = combo_participation(qin_matrix)
         qpl_part = combo_participation(qpl_matrix)
-        if _snap.get("post_time"):
-            S["post_time"] = datetime.fromtimestamp(_snap["post_time"], HKT)  # 自動開跑時間
-            ACTIVE_POST_TIME = S["post_time"]
+        # post_time 已經喺上面統一處理（取眾數），呢度唔再覆寫
     else:
         st.info("💾 雲端記錄模式：呢場暫時未有記錄（recorder 開賣後會自動記）。想即刻睇可揀「🌐 直接連線」。")
 
@@ -2475,9 +2517,10 @@ else:
                         share = (1.0 / o) / inv_sum
                         S["stake_hist"][key].append((ts, share * ptot))
                         S["share_hist"][(pool_code, str(h))].append((ts, share * 100.0))
-        # mtp from snapshot time vs post
-        if snap_now.get("post_time"):
-            mtp = (snap_now["ts"] - snap_now["post_time"]) / 60.0
+        # mtp：用 ACTIVE_POST_TIME（取眾數嗰個），唔可以用個別 snapshot 自己
+        # 嗰個 post_time —— 嗰個可能係 recorder 寫落嘅雜值。
+        if ACTIVE_POST_TIME is not None:
+            mtp = (snap_now["ts"] - ACTIVE_POST_TIME.timestamp()) / 60.0
         else:
             mtp = None
     else:
@@ -2695,7 +2738,13 @@ else:
                     # 唔再讀 S["post_time"]（嗰個可能係上面選單另一場）。
                     _pt = ACTIVE_POST_TIME
                     if _cval == "post":
-                        _target_idx = _n_snaps - 1
+                        # 跳去最接近「開跑時間」嗰個記錄點，唔可以盲跳最後一個
+                        # —— recorder 有時開跑後仲會繼續錄（實測第1場最後一個
+                        # 記錄點係 23:54，即開跑後成 5 個鐘）。
+                        if _pt is not None:
+                            _target_idx = _nearest_snap_idx(replay_snaps, _pt.timestamp())
+                        else:
+                            _target_idx = _n_snaps - 1
                     elif _pt is not None:
                         if _cval == "midnight":
                             _mts = datetime(_pt.year, _pt.month, _pt.day, 0, 0, 0,
@@ -2712,10 +2761,12 @@ else:
 
         def _replay_lbl(i):
             s = replay_snaps[i]
-            pt = s.get("post_time")
-            if pt:
-                _mtp = (s["ts"] - pt) / 60.0
-                return f"開跑前 {abs(_mtp):.0f} 分" if _mtp < 0 else "開跑後"
+            # 用 ACTIVE_POST_TIME（取眾數），唔用 snapshot 自己嗰個 post_time
+            # —— 第1場入面有 15 個寫住 19:00、2 個寫住 19:40，用佢哋會令標籤
+            # 拉去唔同點就跳嚟跳去（實測顯示成「開跑前70分」）。
+            if ACTIVE_POST_TIME is not None:
+                _mtp = (s["ts"] - ACTIVE_POST_TIME.timestamp()) / 60.0
+                return f"開跑前 {abs(_mtp):.0f} 分" if _mtp < 0 else f"開跑後 {_mtp:.0f} 分"
             return datetime.fromtimestamp(s["ts"], HKT).strftime("%H:%M:%S")
 
         replay_idx = st.slider("時間軸（拉去任何一刻，微調）", 0, _n_snaps - 1, key="replay_idx_slider")
