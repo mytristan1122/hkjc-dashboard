@@ -2834,12 +2834,13 @@ else:
             unsafe_allow_html=True)
 
     # ═══ #9 賽事資料 header（跟馬會格式）═══
-    _rinfo_key = f"rinfo_{race_date}_{course}_{race_no}"
+        _info_date, _info_venue, _info_race = ACTIVE_RACE_KEY.split("|", 2)
+    _rinfo_key = f"rinfo_{_info_date}_{_info_venue}_{_info_race}"
     _rinfo_ts_key = _rinfo_key + "_ts"
     _rinfo_age = (_tnow - st.session_state.get(_rinfo_ts_key, _tnow - timedelta(days=1))).total_seconds()
     if _rinfo_key not in st.session_state or _rinfo_age >= 300:
         try:
-            st.session_state[_rinfo_key] = fetch_race_info(str(race_date), course, int(race_no))
+            st.session_state[_rinfo_key] =             st.session_state[_rinfo_key] = fetch_race_info(_info_date, _info_venue, int(_info_race))
         except Exception:
             st.session_state[_rinfo_key] = None
         st.session_state[_rinfo_ts_key] = _tnow
