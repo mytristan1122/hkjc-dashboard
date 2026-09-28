@@ -1,3 +1,2945 @@
+
+import streamlit as st
+import requests
+import time as _time
+import pandas as pd
+import numpy as np
+from datetime import datetime, date, timezone, timedelta
+from collections import defaultdict, deque
+from streamlit_autorefresh import st_autorefresh
+import os
+import json
+import glob
+import sys
+from pathlib import Path
+
+APP_VERSION = "v19.1 MODEL LIVE"
+APP_NAME = "HKJC 即時賠率監察 · NEW"
+
+st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
+                   initial_sidebar_state="collapsed")
+
+# ════════════════════════════════════════════════════════════
+#  HKJC QUANT MODEL (V19 only — old app.py remains untouched)
+# ════════════════════════════════════════════════════════════
+# Default layout:
+#   app-new.py
+#   hkjc_quant/{features.py, model.py, exotics.py, staking.py, ...}
+# Override with HKJC_MODEL_DIR when deployed elsewhere.
+APP_DIR = Path(__file__).resolve().parent
+MODEL_DIR = Path(os.environ.get("HKJC_MODEL_DIR", APP_DIR / "hkjc_quant"))
+MODEL_READY = False
+MODEL_IMPORT_ERROR = None
+try:
+    if str(MODEL_DIR) not in sys.path:
+        sys.path.insert(0, str(MODEL_DIR))
+    from features import build_features
+    from model import public_probabilities
+    from exotics import place_probs
+    MODEL_READY = True
+except Exception as _model_import_exc:
+    MODEL_IMPORT_ERROR = str(_model_import_exc)
+
+
+@st.cache_resource(show_spinner=False)
+def load_quant_assets():
+    """Load the portable model bundle and historical form once per process."""
+    if not MODEL_READY:
+        raise RuntimeError(MODEL_IMPORT_ERROR or "模型模組未能載入")
+    model_path = MODEL_DIR / "models" / "latest_portable.json"
+    history_path = MODEL_DIR / "data" / "runs_clean.csv"
+    with model_path.open("r", encoding="utf-8") as fh:
+        bundle = json.load(fh)
+    history = pd.read_csv(history_path, parse_dates=["race_date"])
+    return bundle, history
+
+
+def _model_apply_scaler(df_features, scaler, feature_cols):
+    """Apply the exact training-time medians/means/stds and column order."""
+    base_cols = [c for c in feature_cols if not c.endswith("_isna")]
+    x = df_features[base_cols].copy()
+    flags = pd.DataFrame(index=x.index)
+    for flag_col in scaler.get("flag_cols", []):
+        source_col = flag_col[:-5] if flag_col.endswith("_isna") else flag_col
+        flags[flag_col] = x[source_col].isna().astype(int)
+    median = pd.Series(scaler["median"], dtype=float)
+    mean = pd.Series(scaler["mean"], dtype=float)
+    std = pd.Series(scaler["std"], dtype=float)
+    x = x.fillna(median)
+    x = (x - mean) / std
+    x = pd.concat([x, flags], axis=1)
+    for col in feature_cols:
+        if col not in x.columns:
+            x[col] = 0.0
+    return x[feature_cols].to_numpy(dtype=np.float64)
+
+
+def _group_softmax(values):
+    values = np.asarray(values, dtype=np.float64)
+    values = values - np.nanmax(values)
+    exp_v = np.exp(np.clip(values, -700, 700))
+    total = exp_v.sum()
+    return exp_v / total if total > 0 else np.full(len(values), 1.0 / len(values))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_live_fundamentals(card_json):
+    """Build pre-race features once; live odds are added separately every refresh."""
+    bundle, history = load_quant_assets()
+    card = pd.DataFrame(json.loads(card_json))
+    card["race_date"] = pd.to_datetime(card["race_date"])
+    for col in ("finishing_position", "finish_time_sec", "lbw"):
+        card[col] = np.nan
+    combined = pd.concat([history, card], ignore_index=True, sort=False)
+    featured = build_features(combined)
+    live = featured[featured["race_id"] == card["race_id"].iloc[0]].copy()
+    live = live.sort_values("horse_no", key=lambda s: pd.to_numeric(s, errors="coerce"))
+    x_live = _model_apply_scaler(live, bundle["scaler"], bundle["feature_cols"])
+    p_model = _group_softmax(x_live @ np.asarray(bundle["cl_beta"], dtype=float))
+    return live[["horse_no", "horse_name"]].assign(p_model=p_model).to_dict("records")
+
+
+def score_live_model(card_rows, win_odds, rebate_rate=0.0):
+    """Return real-time Benter probabilities and value metrics for one race."""
+    if not MODEL_READY or not card_rows or not win_odds:
+        return pd.DataFrame(), MODEL_IMPORT_ERROR or "未有完整排位／即時獨贏賠率"
+    try:
+        bundle, _ = load_quant_assets()
+        card_json = json.dumps(card_rows, ensure_ascii=False, sort_keys=True, default=str)
+        base = pd.DataFrame(build_live_fundamentals(card_json))
+        base["horse_key"] = base["horse_no"].apply(lambda x: str(int(float(x))))
+        base["win_odds"] = base["horse_key"].map(
+            {str(int(float(k))): float(v) for k, v in win_odds.items() if float(v) > 0}
+        )
+        base = base.dropna(subset=["win_odds"]).reset_index(drop=True)
+        if len(base) < 2:
+            return pd.DataFrame(), "有效獨贏賠率不足"
+        race_idx = np.zeros(len(base), dtype=int)
+        p_public = public_probabilities(base["win_odds"].to_numpy(float), race_idx)
+        eps = 1e-12
+        z = (float(bundle["ss_alpha"]) * np.log(np.clip(base["p_model"], eps, 1.0))
+             + float(bundle["ss_beta"]) * np.log(np.clip(p_public, eps, 1.0)))
+        p_final = _group_softmax(z)
+        n_places = 2 if len(base) < 7 else 3
+        if n_places == 2:
+            # Two-place races: sum P(first/second) using fitted lambda2.
+            lam2 = float(bundle["lambda2"])
+            p_place = np.zeros(len(base))
+            for i in range(len(base)):
+                rest = np.delete(p_final, i) ** lam2
+                denom = rest.sum()
+                if denom > 0:
+                    cond = rest / denom
+                    p_place[i] += p_final[i]
+                    p_place[np.arange(len(base)) != i] += p_final[i] * cond
+        else:
+            p_place = place_probs(p_final, float(bundle["lambda2"]), float(bundle["lambda3"]))
+        base["p_public"] = p_public
+        base["p_final"] = p_final
+        base["fair_odds"] = 1.0 / np.clip(p_final, eps, 1.0)
+        base["overlay_pct"] = (p_final / np.clip(p_public, eps, 1.0) - 1.0) * 100.0
+        base["ev"] = p_final * base["win_odds"] + float(rebate_rate) * (1.0 - p_final)
+        base["p_place"] = np.clip(p_place, 0.0, 1.0)
+        base["value"] = base["ev"] - 1.0
+        return base.sort_values("ev", ascending=False), None
+    except Exception as exc:
+        return pd.DataFrame(), f"模型計算失敗：{exc}"
+
+st.markdown("<div style='padding:8px 12px;margin-bottom:8px;border:1px solid #3b82f6;border-radius:8px;font-size:12px'>🆕 <b>NEW REBUILD v19</b> · Replay 使用同一條歷史時間軸 · 估算投注額標示 · 修正 Replay 近1分鐘時間基準</div>", unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════════
+#  DISK STORAGE (永久儲存 — 寫落硬碟，重啟唔失)
+# ════════════════════════════════════════════════════════════
+# 每場一個資料夾，每個時間點一個 JSON snapshot（每 30 秒一次）。
+DATA_DIR = os.environ.get("HKJC_DATA_DIR", os.path.join(os.path.expanduser("~"), "hkjc_data"))
+APP_DATA_DIR = os.environ.get("HKJC_V19_DATA_DIR", os.path.join(os.path.expanduser("~"), "hkjc_data_v19"))
+SNAPSHOT_INTERVAL = 30  # 秒，每隔幾耐存一個 snapshot
+
+def _race_dir(race_key):
+    # encode | as __ and keep the rest; date dashes stay as-is (reversible)
+    safe = race_key.replace("|", "__")
+    return os.path.join(DATA_DIR, safe)
+
+def save_snapshot(race_key, snapshot):
+    """Write one timepoint snapshot to disk as JSON. snapshot is a dict."""
+    try:
+        rd = os.path.join(APP_DATA_DIR, race_key.replace("|", "__"))
+        os.makedirs(rd, exist_ok=True)
+        ts = snapshot.get("ts", datetime.now().timestamp())
+        fn = os.path.join(rd, f"{int(ts)}.json")
+        with open(fn, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+def list_saved_races():
+    """Return list of race_key strings that have saved snapshots on disk."""
+    try:
+        if not os.path.isdir(DATA_DIR):
+            return []
+        out = []
+        for d in os.listdir(DATA_DIR):
+            full = os.path.join(DATA_DIR, d)
+            if os.path.isdir(full) and glob.glob(os.path.join(full, "*.json")):
+                out.append(d.replace("__", "|"))
+        return sorted(out)
+    except Exception:
+        return []
+
+def _nearest_snap_idx(snaps, target_ts):
+    """喺已排序嘅snapshot list入面，搵時間戳最接近target_ts嗰個index。
+    俾REPLAY快捷跳點chip用（例如撳「-30分」就跳去最接近嗰個記錄點）。"""
+    if not snaps or target_ts is None:
+        return None
+    best_i, best_diff = 0, None
+    for i, sp in enumerate(snaps):
+        ts = sp.get("ts")
+        if ts is None:
+            continue
+        d = abs(ts - target_ts)
+        if best_diff is None or d < best_diff:
+            best_diff = d
+            best_i = i
+    return best_i
+
+def load_snapshots(race_key):
+    """Load all snapshots for a race, sorted by ts. Returns list of dicts."""
+    try:
+        rd = _race_dir(race_key)
+        files = sorted(glob.glob(os.path.join(rd, "*.json")), key=lambda p: int(os.path.basename(p)[:-5]))
+        snaps = []
+        for fn in files:
+            try:
+                with open(fn, encoding="utf-8") as f:
+                    snaps.append(json.load(f))
+            except Exception:
+                continue
+        return snaps
+    except Exception:
+        return []
+
+def post_time_from_snaps(snaps):
+    """由一堆 snapshot 取「出現次數最多」嗰個 post_time（眾數）。
+
+    點解唔攞最新一個：recorder 每次拉 HKJC 攞到咩就寫咩，偶然會寫入異常值
+    （實測第1場：19:10 出現 4171 次先係正確，但最後一個 snapshot 寫住 19:00
+    只得 15 次，仲有 2 次 19:40）。取眾數就自動蓋過呢啲少數雜值。
+    LIVE（讀硬碟）同 REPLAY 都用呢一個 function，保證兩邊基準一致。"""
+    counts = {}
+    for sp in snaps or []:
+        p = sp.get("post_time")
+        if p:
+            counts[p] = counts.get(p, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+def post_time_for_race(race_key):
+    """攞某場嘅開跑時間（取眾數）。回傳 datetime 或 None。
+    有 cache（每 5 分鐘先真正掃一次硬碟），唔會每次 refresh 都讀成場。"""
+    ck = f"_posttime_{race_key}"
+    tk = ck + "_ts"
+    now = datetime.now(HKT).timestamp()
+    if ck in st.session_state and (now - st.session_state.get(tk, 0)) < 300:
+        return st.session_state[ck]
+    try:
+        snaps = load_snapshots(race_key)
+    except Exception:
+        snaps = []
+    p = post_time_from_snaps(snaps)
+    val = datetime.fromtimestamp(p, HKT) if p else None
+    st.session_state[ck] = val
+    st.session_state[tk] = now
+    return val
+
+def _settings_path():
+    return os.path.join(APP_DATA_DIR, "_settings.json")
+
+def load_settings():
+    """讀返上次「儲存設定」寫低嘅敏感度數值。有問題就返回空dict（用返程式預設值）。"""
+    try:
+        with open(_settings_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_settings(settings):
+    """將敏感度設定寫落硬碟，下次開app/restart都會自動讀返，唔使成日調。"""
+    try:
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
+        with open(_settings_path(), "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+def load_latest_snapshot(race_key):
+    """讀該場最新一個 snapshot（LIVE 讀硬碟用，快、唔使拉 HKJC）。"""
+    try:
+        rd = _race_dir(race_key)
+        files = glob.glob(os.path.join(rd, "*.json"))
+        if not files:
+            return None
+        latest = max(files, key=lambda p: int(os.path.basename(p)[:-5]))
+        with open(latest, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def sync_state_from_disk(race_key, S):
+    """讀硬碟已經記錄咗嘅 snapshot，補返落 S 嘅 series/stake_hist/share_hist。
+
+    解決問題：LIVE 畫面轉去第2場、再轉返第1場，記憶體入面 S 若果因為
+    session 中斷 / 一段時間冇顯示而跟唔到 recorder 嘅記錄，落注金額表
+    就會顯示唔到之前嘅數。Recorder 一直背景寫緊硬碟（唔理你而家睇緊邊
+    場），所以呢個 function 令 LIVE 同 REPLAY 用返同一個「硬碟為準」嘅
+    數據源：每次顯示呢場，都由硬碟補齊記憶體漏咗嘅時間點（只補新嘅，
+    已經有嘅時間點唔會重覆加，所以成本好細）。"""
+    try:
+        snaps = load_snapshots(race_key)
+    except Exception:
+        snaps = []
+    if not snaps:
+        return
+    last_synced = S.get("_disk_synced_ts", 0.0)
+    new_snaps = [sp for sp in snaps if sp.get("ts", 0) > last_synced]
+    if not new_snaps:
+        return
+    max_ts = last_synced
+    for sp in new_snaps:
+        ts = sp.get("ts")
+        if ts is None:
+            continue
+        max_ts = max(max_ts, ts)
+        pinv = sp.get("pool") or {}
+        for pool_code, odds_map in (("WIN", sp.get("win")), ("PLA", sp.get("pla"))):
+            if not odds_map:
+                continue
+            try:
+                inv_sum = sum(1.0 / float(o) for o in odds_map.values() if float(o) > 0)
+            except Exception:
+                inv_sum = 0.0
+            ptot = pinv.get(pool_code)
+            for h, o in odds_map.items():
+                try:
+                    o = float(o)
+                except Exception:
+                    continue
+                if o <= 0:
+                    continue
+                key = (pool_code, h)
+                S["series"][key].append((ts, o))
+                if key not in S["open_odds"]:
+                    S["open_odds"][key] = o
+                if ptot and inv_sum > 0:
+                    share = (1.0 / o) / inv_sum
+                    S["stake_hist"][key].append((ts, share * ptot))
+                    S["share_hist"][(pool_code, str(h))].append((ts, share * 100.0))
+    S["_disk_synced_ts"] = max_ts
+
+    # ── 修正時間順序 ──
+    # sync補歷史嗰陣，硬碟舊記錄可能加喺記憶體新記錄之後，令次序唔再
+    # 遞增。落注金額表逐格計算靠時間順序搵邊界，次序亂咗就會計錯。
+    # 呢度統一按時間戳(ts)重新排返：唔刪、唔加任何一個記錄點，淨係sort。
+    for store in (S["series"], S["stake_hist"]):
+        for key in list(store.keys()):
+            dq = store[key]
+            if len(dq) < 2:
+                continue
+            sorted_pts = sorted(dq, key=lambda p: p[0])
+            dq.clear()
+            dq.extend(sorted_pts)
+    for key in list(S["share_hist"].keys()):
+        dq = S["share_hist"][key]
+        if len(dq) < 2:
+            continue
+        sorted_pts = sorted(dq, key=lambda p: p[0])
+        dq.clear()
+        dq.extend(sorted_pts)
+
+def _signal_log_path(race_key):
+    return os.path.join(_race_dir(race_key), "signals.jsonl")
+
+def append_signal_log(race_key, event):
+    """即刻寫一行落硬碟（每次訊號一觸發就寫，唔使等30秒snapshot）。"""
+    try:
+        rd = _race_dir(race_key)
+        os.makedirs(rd, exist_ok=True)
+        with open(_signal_log_path(race_key), "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def load_signal_log(race_key, since_ts=0.0):
+    """讀返呢場所有（或指定時間之後）嘅訊號記錄。"""
+    events = []
+    try:
+        path = _signal_log_path(race_key)
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    if ev.get("ts", 0) > since_ts:
+                        events.append(ev)
+    except Exception:
+        pass
+    return events
+
+def sync_signal_log_from_disk(race_key, S):
+    """轉場次/重開之後，由硬碟補返記憶體漏咗嘅訊號記錄。"""
+    last_ts = S.get("_signal_log_synced_ts", 0.0)
+    new_events = load_signal_log(race_key, last_ts)
+    if not new_events:
+        return
+    for ev in new_events:
+        S["signal_log"].append(ev)
+        S["_signal_log_synced_ts"] = max(S.get("_signal_log_synced_ts", 0.0), ev.get("ts", 0.0))
+
+def backfill_signals_from_disk(race_key):
+    """REPLAY揀到一場之前完全未 live 睇過（即係 signals.jsonl 仲未存在）嘅場，
+    就用硬碟完整 snapshot 歷史，事後補跑一次⚡🔥💥偵測邏輯（WIN/PLA/QIN/QPL
+    四個池），寫返落 signals.jsonl。呢個係一次性運算，計完就cache喺硬碟，
+    下次再揀返呢場（LIVE或REPLAY）都唔使重計。"""
+    try:
+        snaps = load_snapshots(race_key)
+    except Exception:
+        snaps = []
+    # 就算冇snapshot都要建立返個（空）file，等佢做「已經處理過」嘅標記，
+    # 唔會下次又再嚟一次。
+    if not snaps:
+        try:
+            os.makedirs(_race_dir(race_key), exist_ok=True)
+            with open(_signal_log_path(race_key), "w", encoding="utf-8") as f:
+                pass
+        except Exception:
+            pass
+        return
+
+    share_hist = defaultdict(list)   # (pool,horse) -> [(ts, share%)]
+    last_tier = {}
+    last_ts_logged = {}
+    events = []
+    t1, t2, t3 = RISE_TIER1, RISE_TIER2, RISE_TIER3   # 用返系統預設門檻（補歷史，唔跟user而家自訂嘅）
+
+    for sp in snaps:
+        ts = sp.get("ts")
+        if ts is None:
+            continue
+
+        for pool_code, snap_key in (("WIN", "win"), ("PLA", "pla")):
+            odds_map = sp.get(snap_key) or {}
+            if not odds_map:
+                continue
+            try:
+                inv_sum = sum(1.0 / float(o) for o in odds_map.values() if float(o) > 0)
+            except Exception:
+                inv_sum = 0.0
+            if inv_sum <= 0:
+                continue
+            for h, o in odds_map.items():
+                try:
+                    o = float(o)
+                except Exception:
+                    continue
+                if o <= 0:
+                    continue
+                share = (1.0 / o) / inv_sum * 100.0
+                share_hist[(pool_code, str(h))].append((ts, share))
+
+        for pool_code, snap_key in (("QIN", "qin"), ("QPL", "qpl")):
+            raw = sp.get(snap_key) or {}
+            if not raw:
+                continue
+            matrix = {}
+            for k, o in raw.items():
+                try:
+                    a_str, b_str = k.split(",")
+                    a, b = int(a_str), int(b_str)
+                    o = float(o)
+                except Exception:
+                    continue
+                if o <= 0:
+                    continue
+                matrix[(a, b)] = o
+            part = combo_participation(matrix)
+            for h, pct in part.items():
+                share_hist[(pool_code, str(h))].append((ts, pct))
+
+        all_horses = set(h for (_p, h) in share_hist.keys())
+        for h in all_horses:
+            rises = {}
+            for pool_code in ("WIN", "PLA", "QIN", "QPL"):
+                hist = share_hist.get((pool_code, h))
+                if not hist or len(hist) < 2:
+                    rises[pool_code] = 0.0
+                    continue
+                last_pt_ts, last_pt_v = hist[-1]
+                cutoff = last_pt_ts - 60
+                base_v = None
+                for hts, hv in hist:
+                    if hts <= cutoff:
+                        base_v = hv
+                if base_v is None:
+                    base_v = hist[0][1]
+                rises[pool_code] = last_pt_v - base_v
+            max_rise = max(rises.values()) if rises else 0.0
+            if max_rise >= t3:
+                tier = 3
+            elif max_rise >= t2:
+                tier = 2
+            elif max_rise >= t1:
+                tier = 1
+            else:
+                tier = 0
+            prev_tier = last_tier.get(h, 0)
+            should_log = False
+            if tier > 0:
+                if tier > prev_tier or (ts - last_ts_logged.get(h, 0)) >= 60:
+                    should_log = True
+            if should_log:
+                cause_pool = max(rises, key=rises.get)
+                events.append({"ts": ts, "horse": h, "pool": cause_pool,
+                               "tier": tier, "rise": round(max_rise, 2)})
+                last_tier[h] = tier
+                last_ts_logged[h] = ts
+            elif tier == 0:
+                last_tier[h] = 0
+
+    try:
+        os.makedirs(_race_dir(race_key), exist_ok=True)
+        with open(_signal_log_path(race_key), "w", encoding="utf-8") as f:
+            for ev in events:
+                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+# ════════════════════════════════════════════════════════════
+#  CONFIG / CONSTANTS
+# ════════════════════════════════════════════════════════════
+API = "https://info.cld.hkjc.com/graphql/base/"
+HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Origin": "https://bet.hkjc.com",
+    "Referer": "https://bet.hkjc.com/",
+    "User-Agent": "Mozilla/5.0",
+}
+HKT = timezone(timedelta(hours=8))   # Hong Kong time
+
+INFO = "#185FA5"     # 落飛 (odds down / money in) — blue
+DANGER = "#A32D2D"   # 回飛 (odds up / money out) — red
+MUTE = "#888888"     # 平穩 (flat) — grey
+
+FLAT_THRESHOLD = 2.0       # |%| <= this  -> 平穩 (faint grey)
+PLUNGE_PCT = 8.0           # drop >= this % within PLUNGE_WINDOW -> 插水 alert
+PLUNGE_WINDOW = 30         # seconds
+AXIS_MINUTES = 14          # countdown axis spans -14min -> 0 (post)
+
+# ── 投注額急升偵測（資金流向表）──
+SURGE_WINDOW = 30          # 近 N 秒
+SURGE_MIN_DROP = 4.0       # 近30秒賠率跌幅 >= 此 % -> ▲ 急跌（有錢入）
+SURGE_BIG_DROP = 8.0       # 近30秒賠率跌幅 >= 此 % -> 🔥 大量湧入
+
+# ── 四池熱度 1分鐘佔比升幅 分層門檻（拉桿可調）──
+RISE_TIER1 = 0.5   # ⚡ 留意
+RISE_TIER2 = 0.8   # 🔥 明顯
+RISE_TIER3 = 1.2   # 💥 強烈
+
+# ── 棒型圖 + 每分鐘金額表 統一「實質金額」門檻（另一組拉桿）──
+MONEY_TIER1 = 100_000   # ⚡ 留意（$）
+MONEY_TIER2 = 200_000   # 🔥 明顯（$）
+MONEY_TIER3 = 400_000   # 💥 強烈（$）
+
+# ── 綜合評分（100 分制）配置 ──
+# 各項滿分：資金急升 40 + 賠率急跌 30 + 水位成熟 20 + 獨位一致 10 = 100
+SCORE_SURGE_MAX = 40       # 資金急升（相對全場突出程度）
+SCORE_DROP_MAX  = 30       # 賠率急跌（絕對跌幅級別）
+SCORE_WATER_MAX = 20       # 水位成熟（越接近 1.21 越高）
+SCORE_AGREE_MAX = 10       # 獨贏／位置同時流入
+SCORE_DROP_FULL = 10.0     # 賠率跌 >= 此 % 得滿分（30）
+WATER_IDEAL = 1.21         # 理論成熟水位
+WATER_LOOSE = 1.45         # 水位 >= 此值 -> 0 分（未成熟）
+
+RACING_QUERY = """
+query racing($date: String, $venueCode: String, $oddsTypes: [OddsType], $raceNo: Int) {
+  raceMeetings(date: $date, venueCode: $venueCode) {
+    pmPools(oddsTypes: $oddsTypes, raceNo: $raceNo) {
+      id
+      status
+      sellStatus
+      oddsType
+      lastUpdateTime
+      guarantee
+      minTicketCost
+      name_en
+      name_ch
+      leg {
+        number
+        races
+      }
+      cWinSelections {
+        composite
+        name_ch
+        name_en
+        starters
+      }
+      oddsNodes {
+        combString
+        oddsValue
+        hotFavourite
+        oddsDropValue
+        bankerOdds {
+          combString
+          oddsValue
+        }
+      }
+    }
+  }
+}
+"""
+
+# Pool investment (turnover) — uses HKJC's EXACT official query verbatim.
+# Whitelist matches the string literally, so DO NOT modify this string.
+TURNOVER_QUERY = "fragment raceFragment on Race {\n  id\n  no\n  status\n  raceName_en\n  raceName_ch\n  postTime\n  country_en\n  country_ch\n  distance\n  wageringFieldSize\n  go_en\n  go_ch\n  ratingType\n  raceTrack {\n    description_en\n    description_ch\n  }\n  raceCourse {\n    description_en\n    description_ch\n    displayCode\n  }\n  claCode\n  raceClass_en\n  raceClass_ch\n  judgeSigns {\n    value_en\n  }\n}\n\nfragment racingBlockFragment on RaceMeeting {\n  jpEsts: pmPools(\n    oddsTypes: [WIN, PLA, TCE, TRI, FF, QTT, DT, TT, SixUP]\n    filters: [\"jackpot\", \"estimatedDividend\"]\n  ) {\n    leg {\n      number\n      races\n    }\n    oddsType\n    jackpot\n    estimatedDividend\n    mergedPoolId\n  }\n  poolInvs: pmPools(\n    oddsTypes: [WIN, PLA, QIN, QPL, CWA, CWB, CWC, IWN, FCT, TCE, TRI, FF, QTT, DBL, TBL, DT, TT, SixUP]\n  ) {\n    id\n    leg {\n      races\n    }\n  }\n  penetrometerReadings(filters: [\"first\"]) {\n    reading\n    readingTime\n  }\n  hammerReadings(filters: [\"first\"]) {\n    reading\n    readingTime\n  }\n  changeHistories(filters: [\"top3\"]) {\n    type\n    time\n    raceNo\n    runnerNo\n    horseName_ch\n    horseName_en\n    jockeyName_ch\n    jockeyName_en\n    scratchHorseName_ch\n    scratchHorseName_en\n    handicapWeight\n    scrResvIndicator\n  }\n}\n\nquery raceMeetings($date: String, $venueCode: String) {\n  timeOffset {\n    rc\n  }\n  activeMeetings: raceMeetings {\n    id\n    venueCode\n    date\n    status\n    races {\n      no\n      postTime\n      status\n      wageringFieldSize\n    }\n    poolInvs: pmPools(\n      oddsTypes: [WIN, PLA, QIN, QPL, CWA, CWB, CWC, IWN, FCT, TCE, TRI, FF, QTT, DBL, TBL, DT, TT, SixUP]\n    ) {\n      status\n    }\n  }\n  raceMeetings(date: $date, venueCode: $venueCode) {\n    id\n    status\n    venueCode\n    date\n    totalNumberOfRace\n    currentNumberOfRace\n    dateOfWeek\n    meetingType\n    totalInvestment\n    country {\n      code\n      namech\n      nameen\n      seq\n    }\n    races {\n      ...raceFragment\n      runners {\n        id\n        no\n        standbyNo\n        status\n        name_ch\n        name_en\n        horse {\n          id\n          code\n        }\n        color\n        barrierDrawNumber\n        handicapWeight\n        currentWeight\n        currentRating\n        internationalRating\n        gearInfo\n        racingColorFileName\n        allowance\n        trainerPreference\n        last6run\n        saddleClothNo\n        trumpCard\n        priority\n        finalPosition\n        deadHeat\n        winOdds\n        jockey {\n          code\n          name_en\n          name_ch\n        }\n        trainer {\n          code\n          name_en\n          name_ch\n        }\n      }\n    }\n    obSt: pmPools(oddsTypes: [WIN, PLA]) {\n      leg {\n        races\n      }\n      oddsType\n      comingleStatus\n    }\n    poolInvs: pmPools(\n      oddsTypes: [WIN, PLA, QIN, QPL, CWA, CWB, CWC, IWN, FCT, TCE, TRI, FF, QTT, DBL, TBL, DT, TT, SixUP]\n    ) {\n      id\n      leg {\n        number\n        races\n      }\n      status\n      sellStatus\n      oddsType\n      investment\n      mergedPoolId\n      lastUpdateTime\n    }\n    ...racingBlockFragment\n    pmPools(oddsTypes: []) {\n      id\n    }\n    jkcInstNo: foPools(oddsTypes: [JKC], filters: [\"top\"]) {\n      instNo\n    }\n    tncInstNo: foPools(oddsTypes: [TNC], filters: [\"top\"]) {\n      instNo\n    }\n  }\n}"
+
+# ════════════════════════════════════════════════════════════
+#  STYLES
+# ════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
+:root {
+  --bg:#0b0e14; --surface:#141925; --card:#161b27; --border:#222b3a;
+  --text:#e6edf3; --subtext:#9aa7b8; --muted:#5b6675;
+}
+html, body, .stApp { background:var(--bg)!important; color:var(--text); font-family:'Inter',sans-serif; }
+#MainMenu, footer, header { visibility:hidden; }
+
+/* ── 減少每 5 秒更新時嘅閃動（又暗又光）── */
+/* 1. 固定背景，refresh 時唔會閃白 */
+.stApp, .main, .block-container { background:var(--bg)!important; }
+/* 2. 停用 Streamlit 每次 rerun 嘅淡入動畫（就係「又暗又光」主因） */
+.stApp [data-testid="stAppViewContainer"] * { animation:none!important; }
+.element-container, .stMarkdown { transition:none!important; animation:none!important; }
+[data-testid="stAppViewBlockContainer"] { opacity:1!important; }
+/* 3. 更新時嘅「running」半透明遮罩，令佢唔會令全頁變暗 */
+[data-testid="stStatusWidget"] { display:none!important; }
+.stApp > div[data-stale="true"] { opacity:1!important; filter:none!important; }
+[data-stale="true"] { opacity:1!important; }
+.block-container { padding:0.8rem 1.6rem 2rem!important; max-width:100%!important; }
+.hdr { display:flex; align-items:center; justify-content:space-between; padding:10px 16px;
+  background:var(--surface); border:1px solid var(--border); border-radius:10px; margin-bottom:10px; }
+.hdr-title { font-size:16px; font-weight:600; color:var(--text); }
+.live { font-family:'JetBrains Mono',monospace; font-size:11px; color:#ff5757;
+  background:rgba(255,87,87,0.12); border:1px solid rgba(255,87,87,0.35);
+  padding:3px 10px; border-radius:20px; }
+.live-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:#ff5757;
+  margin-right:5px; animation:pulse 1.4s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+@keyframes surgeflash { 0%,100%{background:rgba(239,68,68,0.18)} 50%{background:rgba(239,68,68,0.04)} }
+.surge-gate { animation:surgeflash 1.1s infinite; border-radius:6px; }
+.stake-barwrap { flex:1; min-width:0; height:9px; background:rgba(255,255,255,0.06); border-radius:4px; overflow:hidden; display:flex; align-items:center; }
+.stake-bar { display:block; height:100%; border-radius:4px; }
+.alert-bar { background:rgba(163,45,45,0.15); border:1px solid rgba(163,45,45,0.4);
+  border-radius:8px; padding:8px 14px; margin-bottom:10px; font-size:13px; color:#ff8585; }
+.panel { background:var(--card); border:1px solid var(--border); border-radius:12px;
+  padding:12px 14px; margin-bottom:10px; }
+.panel-title { font-size:13px; font-weight:600; color:var(--text); margin-bottom:2px; }
+.panel-sub { font-size:11px; color:var(--subtext); margin-bottom:8px; }
+.legend { display:flex; flex-wrap:wrap; gap:14px; margin-top:8px;
+  font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--subtext); }
+.legend i { display:inline-block; width:13px; height:2px; vertical-align:middle; margin-right:3px; }
+.row { display:flex; gap:8px; align-items:center; padding:2.5px 0; border-bottom:0.5px solid var(--border); }
+.row:hover { background:rgba(255,255,255,0.03); }
+.c-no { width:30px; flex:none; font-size:12px; font-weight:600; }
+.c-spark { flex:1; min-width:0; }
+.c-num { width:42px; flex:none; text-align:right; font-family:'JetBrains Mono',monospace; font-size:11px; }
+.c-chg { width:48px; flex:none; text-align:right; font-family:'JetBrains Mono',monospace; font-size:11px; }
+.c-score { flex:1; min-width:0; text-align:right; font-family:'JetBrains Mono',monospace; }
+.thead { display:flex; gap:8px; padding-bottom:5px; border-bottom:0.5px solid var(--border);
+  font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--muted); }
+.axis { display:flex; gap:8px; margin-top:2px; padding-top:5px; border-top:0.5px solid var(--border); }
+.axis-inner { flex:1; display:flex; justify-content:space-between; }
+.axis-inner span { font-family:'JetBrains Mono',monospace; font-size:9px; color:var(--muted); }
+.rank-row { padding:5px 0; border-bottom:0.5px solid var(--border); }
+.rank-head { display:flex; justify-content:space-between; margin-bottom:3px; }
+.rank-bar { height:5px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden; }
+.rank-fill { height:100%; }
+.flame { color:#ff5757; font-size:10px; margin-left:2px; }
+.div-row { display:flex; align-items:center; gap:10px; padding:6px 0;
+  border-bottom:0.5px solid var(--border); flex-wrap:wrap; font-size:12px; }
+.pill { font-size:11px; padding:2px 8px; border-radius:6px; }
+.pill-win { background:rgba(24,95,165,0.18); color:#5ea0e0; }
+.pill-mute { background:rgba(255,255,255,0.06); color:var(--subtext); }
+.empty { text-align:center; padding:3rem; color:var(--subtext); }
+
+/* ── st.container(border=True) 改返跟 .panel 一樣嘅深色風格（右邊訊號彙總用）── */
+[data-testid="stVerticalBlockBorderWrapper"] {
+  background:var(--card) !important; border:1px solid var(--border) !important;
+  border-radius:12px !important; padding:2px 14px 14px !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stExpander"] {
+  background:transparent; border:1px solid var(--border); border-radius:8px; margin-bottom:4px;
+}
+
+/* ── ③四池熱度 + 30分鐘訊號彙總：兩個column stretch去到一樣高 ── */
+.st-key-heat_signal_row [data-testid="stHorizontalBlock"] { align-items:stretch; }
+.st-key-heat_signal_row [data-testid="column"] > div { height:100%; }
+.st-key-heat_signal_row .panel { height:100%; box-sizing:border-box; }
+.st-key-heat_signal_row [data-testid="stVerticalBlockBorderWrapper"] { height:100%; box-sizing:border-box; }
+
+/* ── 手機優化（窄螢幕）── */
+@media (max-width: 640px) {
+  .block-container { padding-left:0.5rem !important; padding-right:0.5rem !important;
+    padding-top:1rem !important; }
+  .panel { padding:10px !important; }
+  .c-no { width:26px; font-size:11px; }
+  .c-num { width:38px; font-size:10px; }
+  .c-chg { width:44px; font-size:10px; }
+  .c-score { font-size:10px; }
+  .panel-title { font-size:13px; }
+  .panel-sub { font-size:10px; }
+  .row { padding:4px 0; }
+  /* 讓左右兩欄（獨贏/位置）喺手機直接上下排 */
+  [data-testid="column"] { width:100% !important; flex:1 1 100% !important;
+    min-width:100% !important; }
+}
+</style>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+""", unsafe_allow_html=True)
+
+st_autorefresh(interval=5000, key="auto_refresh")
+
+# ════════════════════════════════════════════════════════════
+#  SESSION STATE (multi-race: each race keeps its own history)
+# ════════════════════════════════════════════════════════════
+def _blank_state():
+    return {
+        "race_key": None,
+        "open_odds": {},      # (pool, horse) -> first odds seen
+        "last_odds": {},      # (pool, horse) -> previous odds
+        "series": defaultdict(lambda: deque(maxlen=400)),  # (pool,horse)->[(x_min, odds)]
+        "stake_hist": defaultdict(lambda: deque(maxlen=400)),  # (pool,horse)->[(ts_epoch, stake$)]
+        "ever_surged": {},    # (pool,horse) -> peak drop% ever seen (for 🔥 memory)
+        "share_hist": defaultdict(lambda: deque(maxlen=400)),  # (pool,horse)->[(ts,share%)]
+        "post_time": None,    # datetime in HKT
+        "started_at": None,   # when monitoring began
+        "signal_log": deque(maxlen=300),  # [{ts,horse,pool,tier,rise}] 30分鐘訊號記錄
+        "_last_logged_tier": {},   # horse -> 上次記錄嘅 tier（升級先再記，避免洗版）
+        "_last_logged_ts": {},     # horse -> 上次記錄時間（同 tier 相同時隔60秒先再記）
+        "_signal_log_synced_ts": 0.0,  # 由硬碟補齊 signal_log 補到邊
+    }
+
+# RACES: race_key -> state dict. Switching races no longer wipes data;
+# each race accumulates independently and is remembered.
+if "RACES" not in st.session_state:
+    st.session_state.RACES = {}
+
+# 開機讀一次硬碟settings（如果之前撳過「儲存設定」），補做預設值。
+if "_settings_loaded" not in st.session_state:
+    for _k, _v in (load_settings() or {}).items():
+        st.session_state.setdefault(_k, _v)
+    st.session_state["_settings_loaded"] = True
+
+def get_state(race_key):
+    if race_key not in st.session_state.RACES:
+        s = _blank_state()
+        s["race_key"] = race_key
+        s["started_at"] = datetime.now(HKT)
+        st.session_state.RACES[race_key] = s
+    return st.session_state.RACES[race_key]
+
+def reset_state(race_key):
+    """Reset only the given race's accumulated history."""
+    s = _blank_state()
+    s["race_key"] = race_key
+    s["started_at"] = datetime.now(HKT)
+    st.session_state.RACES[race_key] = s
+    return s
+
+# ════════════════════════════════════════════════════════════
+#  DATA FETCH
+# ════════════════════════════════════════════════════════════
+def _to_float(x):
+    try: return float(x)
+    except: return 0.0
+
+def fetch_race(date_str, course, race_no):
+    """Fetch odds using the EXACT original whitelisted query (verbatim)."""
+    payload = {"operationName": "racing",
+               "variables": {"date": date_str, "venueCode": course,
+                             "raceNo": race_no, "oddsTypes": ["WIN", "PLA"]},
+               "query": RACING_QUERY}
+    r = requests.post(API, headers=HEADERS, json=payload, timeout=20)
+    j = r.json()
+    meetings = j.get("data", {}).get("raceMeetings", []) or []
+    for m in meetings:
+        if m.get("pmPools"):
+            return m["pmPools"]
+    return []
+
+def fetch_all_meetings():
+    """#8：用 activeMeetings 自動攞晒所有『有賽事』嘅日期+場地（包括海外）。
+    Returns list of {date, venue, label, races}. 唔使手動揀日期/場地。"""
+    out = []
+    try:
+        payload = {"operationName": "raceMeetings",
+                   "variables": {"date": None, "venueCode": None},
+                   "query": TURNOVER_QUERY}
+        r = requests.post(API, headers=HEADERS, json=payload, timeout=20)
+        j = r.json()
+        if isinstance(j, dict) and j.get("errors"):
+            return []
+        ams = (j.get("data", {}) or {}).get("activeMeetings", []) or []
+        for m in ams:
+            d = (m.get("date") or "")[:10]
+            v = m.get("venueCode")
+            if not d or not v:
+                continue
+            races = m.get("races") or []
+            out.append({"date": d, "venue": v, "n_races": len(races),
+                        "status": m.get("status"), "races": races})
+    except Exception:
+        return []
+    # 去重 + 按日期排
+    seen = set(); uniq = []
+    for m in out:
+        k = (m["date"], m["venue"])
+        if k in seen:
+            continue
+        seen.add(k); uniq.append(m)
+    return sorted(uniq, key=lambda x: (x["date"], x["venue"]))
+
+VENUE_NAMES = {"ST": "沙田", "HV": "跑馬地"}
+def venue_label(v):
+    return VENUE_NAMES.get(v, v)   # 海外場地就直接顯示 code
+
+def fetch_race_info(date_str, venue, race_no):
+    """攞賽事資料及模型所需完整排位，全部都係開跑前已知欄位。"""
+    try:
+        payload = {"operationName": "raceMeetings",
+                   "variables": {"date": date_str, "venueCode": venue},
+                   "query": TURNOVER_QUERY}
+        r = requests.post(API, headers=HEADERS, json=payload, timeout=20)
+        j = r.json()
+        if isinstance(j, dict) and j.get("errors"):
+            return None
+        meetings = (j.get("data", {}) or {}).get("raceMeetings", []) or []
+        if not meetings:
+            return None
+        m = meetings[0]
+        info = {"venue": m.get("venueCode"), "date": (m.get("date") or "")[:10],
+                "dow": m.get("dateOfWeek"), "total": m.get("totalNumberOfRace")}
+        for rc in (m.get("races") or []):
+            if rc.get("no") == int(race_no):
+                track = (rc.get("raceTrack") or {}).get("description_ch")
+                course_d = (rc.get("raceCourse") or {}).get("description_ch")
+                track_config = (rc.get("raceCourse") or {}).get("displayCode") or ""
+                class_raw = rc.get("claCode") or rc.get("raceClass_en") or rc.get("raceClass_ch")
+                try:
+                    class_level = int("".join(ch for ch in str(class_raw) if ch.isdigit()) or 0)
+                except Exception:
+                    class_level = 0
+                active_runners = [x for x in (rc.get("runners") or [])
+                                  if str(x.get("status") or "").upper() not in
+                                  ("SCRATCHED", "SCR", "WITHDRAWN")]
+                field_size = int(rc.get("wageringFieldSize") or len(active_runners) or 0)
+                race_id = f"{date_str.replace('-', '')}_{venue}_{int(race_no)}"
+                card_rows = []
+                for runner in active_runners:
+                    horse = runner.get("horse") or {}
+                    jockey = runner.get("jockey") or {}
+                    trainer = runner.get("trainer") or {}
+                    horse_no = runner.get("no") or runner.get("saddleClothNo")
+                    horse_id = horse.get("id") or horse.get("code") or runner.get("id")
+                    if horse_no is None or not horse_id:
+                        continue
+                    card_rows.append({
+                        "race_id": race_id, "race_date": date_str,
+                        "season": "LIVE", "venue": venue, "race_no": int(race_no),
+                        "distance": _to_float(rc.get("distance")),
+                        "going": rc.get("go_ch") or rc.get("go_en") or "",
+                        "track": track or "", "track_config": track_config,
+                        "class_level": class_level, "field_size": field_size,
+                        "horse_no": _to_float(horse_no), "horse_id": str(horse_id),
+                        "horse_name": runner.get("name_ch") or runner.get("name_en") or str(horse_no),
+                        "jockey_id": jockey.get("code") or "UNKNOWN",
+                        "trainer_id": trainer.get("code") or "UNKNOWN",
+                        "draw": _to_float(runner.get("barrierDrawNumber")),
+                        "actual_weight": _to_float(runner.get("handicapWeight")),
+                        "declared_horse_weight": _to_float(runner.get("currentWeight")),
+                        "runner_status": runner.get("status") or "Declared",
+                    })
+                info.update({
+                    "no": rc.get("no"),
+                    "name": rc.get("raceName_ch"),
+                    "post": rc.get("postTime"),
+                    "dist": rc.get("distance"),
+                    "cls": rc.get("raceClass_ch"),
+                    "track": track, "course": course_d,
+                    "going": rc.get("go_ch"),
+                    "field": field_size,
+                    "card_rows": card_rows,
+                })
+                break
+        return info
+    except Exception:
+        return None
+
+def fetch_turnover(date_str, course):
+    """Return {race_no: {'WIN': float, 'PLA': float, 'post': str}, 'total': float}.
+    Uses HKJC's EXACT official query verbatim so it passes the whitelist.
+    One call covers the whole meeting (all races) — includes postTime (開跑時間)."""
+    out = {}
+    payload = {"operationName": "raceMeetings",
+               "variables": {"date": date_str, "venueCode": course},
+               "query": TURNOVER_QUERY}
+    r = requests.post(API, headers=HEADERS, json=payload, timeout=20)
+    j = r.json()
+    if isinstance(j, dict) and j.get("errors"):
+        return {}
+    meetings = (j.get("data", {}) or {}).get("raceMeetings", []) or []
+    for m in meetings:
+        out["total"] = _to_float(m.get("totalInvestment"))
+        # postTime per race (races[].no / races[].postTime)
+        for rc in (m.get("races") or []):
+            rno = rc.get("no")
+            pt = rc.get("postTime")
+            if rno is not None and pt:
+                out.setdefault(int(rno), {})["post"] = pt
+        for p in (m.get("poolInvs") or []):
+            otype = p.get("oddsType")
+            if otype not in ("WIN", "PLA", "QIN", "QPL"):
+                continue
+            inv = _to_float(p.get("investment"))
+            races = (p.get("leg") or {}).get("races") or []
+            for rno in races:
+                out.setdefault(int(rno), {})[otype] = inv
+    return out
+
+def fetch_combo(date_str, course, race_no):
+    """Fetch QIN (連贏) + QPL (位置Q) odds. Same verbatim query, only the
+    oddsTypes VARIABLE changes (query string unchanged -> no whitelist risk).
+    Returns the raw pmPools list for combination pools."""
+    payload = {"operationName": "racing",
+               "variables": {"date": date_str, "venueCode": course,
+                             "raceNo": race_no, "oddsTypes": ["QIN", "QPL"]},
+               "query": RACING_QUERY}
+    try:
+        r = requests.post(API, headers=HEADERS, json=payload, timeout=20)
+        j = r.json()
+        if isinstance(j, dict) and j.get("errors"):
+            return []
+        meetings = j.get("data", {}).get("raceMeetings", []) or []
+        for m in meetings:
+            if m.get("pmPools"):
+                return m["pmPools"]
+    except Exception:
+        return []
+    return []
+
+def combo_to_matrix(pools, pool_type):
+    """Parse a combination pool (QIN/QPL) into {(a,b): odds} with a<b (ints),
+    plus a per-horse participation sum {horse: total 1/odds across its pairs}.
+    combString for pairs looks like '3,7' or '3-7'."""
+    matrix = {}
+    for p in pools:
+        if p.get("oddsType") != pool_type:
+            continue
+        for n in p.get("oddsNodes", []):
+            comb = n.get("combString") or ""
+            odds = _to_float(n.get("oddsValue"))
+            if odds <= 0:
+                continue
+            parts = comb.replace("-", ",").split(",")
+            if len(parts) != 2:
+                continue
+            try:
+                a, b = int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+            if a > b:
+                a, b = b, a
+            matrix[(a, b)] = odds
+    return matrix
+
+def combo_participation(matrix):
+    """Per-horse participation in a combo pool = sum of 1/odds over all pairs
+    containing that horse. Higher = more money concentrated on that horse's
+    combinations. Returns {horse:int -> share% within pool}."""
+    raw = {}
+    for (a, b), odds in matrix.items():
+        if odds <= 0:
+            continue
+        inv = 1.0 / odds
+        raw[a] = raw.get(a, 0.0) + inv
+        raw[b] = raw.get(b, 0.0) + inv
+    total = sum(raw.values())
+    if total <= 0:
+        return {}
+    return {h: v / total * 100.0 for h, v in raw.items()}
+
+def record_share(S, pool, horse, share_pct):
+    """Record a horse's pool share% at current time for rise detection."""
+    S["share_hist"][(pool, str(horse))].append((datetime.now(HKT).timestamp(), share_pct))
+
+def share_rise(S, pool, horse, seconds=60):
+    """% points the horse's share rose over the last N seconds (default 1 min)."""
+    hist = S["share_hist"][(pool, str(horse))]
+    if len(hist) < 2:
+        return 0.0
+    last_ts, last_v = hist[-1]
+    cutoff = last_ts - seconds
+    base_v = None
+    for ts, v in hist:
+        if ts <= cutoff:
+            base_v = v
+    if base_v is None:
+        base_v = hist[0][1]
+    return last_v - base_v   # positive = share grew
+
+def parse_post_time(pt_str):
+    """HKJC postTime is ISO-ish, e.g. '2026-06-10T14:46:00+08:00'."""
+    if not pt_str:
+        return None
+    try:
+        s = pt_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=HKT)
+        return dt.astimezone(HKT)
+    except Exception:
+        return None
+
+def pools_to_df(pools):
+    rows = []
+    for p in pools:
+        pool_type = p.get("oddsType")
+        for n in p.get("oddsNodes", []):
+            odds = _to_float(n.get("oddsValue"))
+            # Skip scratched / withdrawn runners: HKJC returns them with a
+            # non-numeric or 0 oddsValue (e.g. "SCR", "---", "0"). A runner
+            # still in the race always has a positive win/place odds once the
+            # pool is selling, so odds <= 0 means it should not be shown.
+            if odds <= 0:
+                continue
+            rows.append({"池": pool_type,
+                         "馬號": n.get("combString"),
+                         "賠率": odds,
+                         "大熱": bool(n.get("hotFavourite"))})
+    return pd.DataFrame(rows)
+
+# ════════════════════════════════════════════════════════════
+#  ENRICH + HISTORY
+# ════════════════════════════════════════════════════════════
+def minutes_to_post(now_hkt, post_time):
+    """Negative minutes before post; 0 at post. None if unknown."""
+    if post_time is None:
+        return None
+    delta = (post_time - now_hkt).total_seconds() / 60.0
+    return -max(0.0, delta) if delta >= 0 else delta  # keep sign; negative = before post
+
+def enrich(df, S, as_of_ts=None, record=True):
+    """Add derived odds fields using a single time base.
+    as_of_ts is the selected replay timestamp; LIVE leaves it None.
+    """
+    now_hkt = datetime.fromtimestamp(as_of_ts, HKT) if as_of_ts is not None else datetime.now(HKT)
+    mtp = minutes_to_post(now_hkt, S["post_time"])
+
+    open_arr, live_arr, chg_arr, dir_arr = [], [], [], []
+    new_last = {}
+    for _, r in df.iterrows():
+        key = (r["池"], r["馬號"])
+        curr = r["賠率"]
+        new_last[key] = curr
+
+        # open odds (locked once)
+        if key not in S["open_odds"] and curr > 0:
+            S["open_odds"][key] = curr
+        opn = S["open_odds"].get(key, curr)
+
+        # % change vs open — sign follows odds movement:
+        #   negative = odds dropped (落飛), positive = odds rose (回飛)
+        if opn and opn > 0:
+            pct = (curr - opn) / opn * 100.0
+        else:
+            pct = 0.0
+
+        if abs(pct) <= FLAT_THRESHOLD:
+            d = "flat"
+        elif pct < 0:
+            d = "down"   # odds dropped => 落飛
+        else:
+            d = "up"     # odds rose => 回飛
+
+        open_arr.append(opn); live_arr.append(curr)
+        chg_arr.append(pct); dir_arr.append(d)
+
+        # Store the same timestamp used for this calculation. In REPLAY the
+        # selected snapshot timestamp is used; LIVE uses wall-clock time.
+        if record and curr > 0:
+            S["series"][key].append((now_hkt.timestamp(), curr))
+
+    S["last_odds"] = new_last
+    df["開賠"] = open_arr
+    df["即場"] = live_arr
+    df["變化"] = chg_arr
+    df["方向"] = dir_arr
+    return df, mtp
+
+def record_into_state(pools, S):
+    """Lightweight background recorder — appends odds to a race's series & open_odds.
+    Used for the non-displayed races in the sliding window."""
+    if not pools:
+        return
+    now_hkt = datetime.now(HKT)
+    for p in pools:
+        pool_type = p.get("oddsType")
+        for n in p.get("oddsNodes", []):
+            horse = n.get("combString")
+            curr = _to_float(n.get("oddsValue"))
+            if curr <= 0:
+                continue
+            key = (pool_type, horse)
+            if key not in S["open_odds"]:
+                S["open_odds"][key] = curr
+            S["series"][key].append((now_hkt.timestamp(), curr))
+
+def recent_speed(S, key, seconds=30):
+    """Decay-weighted recent % move magnitude over last N sec — for ranking & plunge."""
+    series = S["series"][key]
+    if len(series) < 2:
+        return 0.0, 0.0
+    last_ts, last_v = series[-1]   # series stores (epoch_seconds, odds)
+    cutoff = last_ts - seconds     # epoch seconds
+    base_v = None
+    for ts, v in series:
+        if ts <= cutoff:
+            base_v = v
+    if base_v is None:
+        base_v = series[0][1]
+    if base_v <= 0:
+        return 0.0, 0.0
+    pct = (base_v - last_v) / base_v * 100.0  # positive = dropped
+    return pct, abs(pct)
+
+def record_stakes(df_pool, pool_name, pool_inv, S):
+    """Record each horse's current stake ($ = live-share x pool_inv) into stake_hist,
+    timestamped by wall-clock epoch seconds. Only when pool_inv is known."""
+    if pool_inv is None or pool_inv <= 0:
+        return
+    sub = df_pool[df_pool["即場"] > 0].copy()
+    if sub.empty:
+        return
+    inv_live = 1.0 / sub["即場"]
+    shares = inv_live / inv_live.sum()
+    ts = datetime.now(HKT).timestamp()
+    for (_, r), sh in zip(sub.iterrows(), shares):
+        key = (pool_name, r["馬號"])
+        S["stake_hist"][key].append((ts, sh * pool_inv))
+
+def recent_stake_gain(S, pool_name, horse, seconds=30):
+    """Return $ increase in this horse's stake over the last N seconds."""
+    hist = S["stake_hist"][(pool_name, horse)]
+    if len(hist) < 2:
+        return 0.0
+    last_ts, last_v = hist[-1]
+    cutoff = last_ts - seconds
+    base_v = None
+    for ts, v in hist:
+        if ts <= cutoff:
+            base_v = v
+    if base_v is None:
+        base_v = hist[0][1]
+    return last_v - base_v   # positive = stake grew
+
+def stake_change_since_open(S, pool_name, horse):
+    """Method B: $ change in this horse's stake since first recorded point.
+    Uses stake_hist so each timepoint used its own real pool total (no mixing)."""
+    hist = S["stake_hist"][(pool_name, horse)]
+    if len(hist) < 2:
+        return 0.0
+    return hist[-1][1] - hist[0][1]   # live stake - first-seen stake
+
+def stake_at_ts(S, pool_name, horse, target_ts):
+    """該馬喺 target_ts（或之前最接近）嘅累積投注額（佔比法）。冇就 None。"""
+    hist = S["stake_hist"][(pool_name, str(horse))]
+    if not hist:
+        return None
+    best = None
+    for ts, v in hist:
+        if ts <= target_ts:
+            best = v
+    return best if best is not None else hist[0][1]
+
+def stake_in_bucket(S, pool_name, horse, ts_start, ts_end):
+    """該馬喺 [ts_start, ts_end] 呢段流入嘅金額 = end 累積 − start 累積。
+    佔比法，同棒型圖同一把尺。"""
+    s_end = stake_at_ts(S, pool_name, horse, ts_end)
+    s_start = stake_at_ts(S, pool_name, horse, ts_start)
+    if s_end is None or s_start is None:
+        return None
+    return s_end - s_start
+
+def latest_minute_gain(S, pool_name, horse, end_ts):
+    """Use real samples spanning the latest minute; missing baseline stays blank."""
+    hist = S["stake_hist"][(pool_name, str(horse))]
+    cutoff = end_ts - 60
+    before = [(ts, value) for ts, value in hist if ts <= cutoff]
+    at_end = [(ts, value) for ts, value in hist if ts <= end_ts]
+    if not before or not at_end:
+        return None
+    start_ts, start_value = before[-1]
+    end_sample_ts, end_value = at_end[-1]
+    if cutoff - start_ts > 45 or end_sample_ts <= cutoff:
+        return None
+    return end_value - start_value
+
+def current_stake(S, pool_name, horse):
+    """該馬即場累積總投注額（佔比法，= 棒型圖棒高 = 每分鐘表合計）。"""
+    hist = S["stake_hist"][(pool_name, str(horse))]
+    return hist[-1][1] if hist else None
+
+def stake_at_ts_disk(snaps, pool_name, horse, target_ts):
+    """由硬碟 snapshot（已按時間排序，冇上限）重建該馬喺 target_ts 嗰刻嘅
+    累積投注額。同 stake_at_ts() 邏輯一樣（佔比法），分別係呢個唔受記憶體
+    deque 嘅 maxlen 限制 —— 開賣提前幾多個鐘、甚至跨日都計得到。"""
+    if target_ts is None:
+        return None
+    best = None
+    for sp in snaps:
+        ts = sp.get("ts")
+        if ts is None or ts > target_ts:
+            continue
+        odds_map = sp.get("win") if pool_name == "WIN" else sp.get("pla")
+        if not odds_map:
+            continue
+        o = odds_map.get(str(horse))
+        if o is None:
+            continue
+        try:
+            o = float(o)
+        except Exception:
+            continue
+        if o <= 0:
+            continue
+        try:
+            inv_sum = sum(1.0 / float(v) for v in odds_map.values() if float(v) > 0)
+        except Exception:
+            inv_sum = 0.0
+        ptot = (sp.get("pool") or {}).get(pool_name)
+        if not ptot or inv_sum <= 0:
+            continue
+        best = (1.0 / o) / inv_sum * ptot
+    return best
+
+def compute_early_buckets_from_disk(race_key, pool_name, horses, midnight_ts, edge60_ts,
+                                    ttl=60, as_of_ts=None):
+    """「隔夜」「當日」直接由硬碟 snapshot 計，解決開賣提前超過24小時、記憶體
+    deque 裝唔晒嘅問題。用 session_state cache 住結果，每 ttl 秒（預設60）先
+    真正重新掃一次硬碟；中間嘅5秒refresh就直接攞返cache嘅數，唔會拖慢畫面，
+    亦唔會拖硬碟IO。
+
+    as_of_ts：只計到呢一刻為止（REPLAY 用，等「隔夜/當日」同其他欄一齊
+    停喺時間軸揀咗嗰一刻；LIVE 傳 None 就用晒所有記錄）。"""
+    cache_key = f"_early_buckets_{race_key}_{pool_name}_{int(as_of_ts) if as_of_ts else 'live'}"
+    ts_key = cache_key + "_ts"
+    now = datetime.now(HKT).timestamp()
+    last = st.session_state.get(ts_key, 0.0)
+    if cache_key in st.session_state and (now - last) < ttl:
+        return st.session_state[cache_key]
+    result = {}
+    if midnight_ts is not None and edge60_ts is not None:
+        try:
+            snaps = load_snapshots(race_key)
+        except Exception:
+            snaps = []
+        if as_of_ts is not None:
+            snaps = [sp for sp in snaps if (sp.get("ts") or 0) <= as_of_ts]
+        if snaps:
+            for h in horses:
+                h = str(h)
+                # 彩池打從開賣就係由 $0 開始累積，所以 stake_at_ts_disk() 直接
+                # 攞返嘅係「絕對值」，唔使再減走「第一個snapshot」做基準
+                # （減咗反而會漏走開賣到第一個snapshot呢一小段，令合計對唔上）。
+                v_mid = stake_at_ts_disk(snaps, pool_name, h, midnight_ts)
+                v_60 = stake_at_ts_disk(snaps, pool_name, h, edge60_ts)
+                overnight = v_mid if v_mid is not None else None
+                today = (v_60 - v_mid) if (v_60 is not None and v_mid is not None) else None
+                result[h] = {"隔夜": overnight, "當日": today}
+    st.session_state[cache_key] = result
+    st.session_state[ts_key] = now
+    return result
+
+# ════════════════════════════════════════════════════════════
+#  RENDER HELPERS
+# ════════════════════════════════════════════════════════════
+def spark_svg(series, color, faint, countdown=True):
+    """Inline SVG sparkline using viewBox 0-100 so it always fills its column.
+    countdown=True: x axis fixed -14min -> 0 (post), with countdown gridlines.
+    countdown=False: x axis auto-ranges to data extent (elapsed time)."""
+    if not series:
+        return '<svg viewBox="0 0 100 22" preserveAspectRatio="none" width="100%" height="22"></svg>'
+
+    if countdown:
+        x_min, x_max = -AXIS_MINUTES, 0.0
+        gridlines = (-10, -6, -2)
+    else:
+        xs = [x for x, _ in series]
+        x_min, x_max = min(xs), max(xs)
+        if x_max - x_min < 0.01:
+            x_max = x_min + 1.0   # avoid zero span before data accumulates
+        gridlines = ()
+
+    ys = [v for _, v in series]
+    ymin, ymax = min(ys), max(ys)
+    rng = (ymax - ymin) or 1.0
+    span = (x_max - x_min) or 1.0
+
+    def px(x):
+        xx = max(x_min, min(x_max, x))
+        return (xx - x_min) / span * 100.0
+
+    def py(v):
+        return 22 - (v - ymin) / rng * (22 - 4) - 2
+
+    pts = " ".join(f"{px(x):.2f},{py(v):.1f}" for x, v in series)
+    lx, lv = series[-1]
+    dot = "" if faint else f'<circle cx="{px(lx):.2f}" cy="{py(lv):.1f}" r="1.8" fill="{color}" vector-effect="non-scaling-stroke"/>'
+    grid = "".join(
+        f'<line x1="{px(g):.2f}" y1="0" x2="{px(g):.2f}" y2="22" stroke="rgba(128,128,128,0.13)" stroke-width="0.4"/>'
+        for g in gridlines
+    )
+    dash = ' stroke-dasharray="2,1.5"' if faint else ""
+    sw = 0.9 if faint else 1.4
+    op = 0.45 if faint else 1.0
+    return (f'<svg viewBox="0 0 100 22" preserveAspectRatio="none" width="100%" height="22" style="display:block;">'
+            f'{grid}<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="{sw}" '
+            f'opacity="{op}"{dash} vector-effect="non-scaling-stroke"/>{dot}</svg>')
+
+def dir_color(d):
+    return {"down": INFO, "up": DANGER, "flat": MUTE}[d]
+
+def series_to_x(series, S, countdown):
+    """Convert stored (epoch, odds) points to (display_x_min, odds).
+    countdown=True: x = minutes-to-post (negative before post, 0 at post).
+    countdown=False: x = minutes since first recorded point (elapsed)."""
+    if not series:
+        return []
+    post = S.get("post_time")
+    if countdown and post is not None:
+        post_ts = post.timestamp()
+        return [((ts - post_ts) / 60.0, v) for ts, v in series]  # negative before post
+    # elapsed: relative to first point
+    t0 = series[0][0]
+    return [((ts - t0) / 60.0, v) for ts, v in series]
+
+def trend_panel(df_pool, S, pool_title, countdown=True):
+    rows_html = []
+    sub = df_pool.sort_values("馬號", key=lambda s: pd.to_numeric(s, errors="coerce"))
+    for _, r in sub.iterrows():
+        key = (r["池"], r["馬號"])
+        d = r["方向"]
+        col = dir_color(d)
+        faint = (d == "flat")
+        name_col = "var(--subtext)" if faint else "var(--text)"
+        chg = r["變化"]
+        sign = "+" if chg > 0 else ""
+        chg_col = MUTE if faint else col
+        hot = '<span class="flame">🔥</span>' if r.get("大熱") else ""
+        series = series_to_x(list(S["series"][key]), S, countdown)
+        spark = spark_svg(series, col, faint, countdown=countdown)
+        rows_html.append(
+            f'<div class="row">'
+            f'<span class="c-no" style="color:{name_col}">{r["馬號"]}{hot}</span>'
+            f'<span class="c-spark">{spark}</span>'
+            f'<span class="c-num" style="color:var(--subtext)">{r["開賠"]:.1f}</span>'
+            f'<span class="c-num" style="color:{name_col}">{r["即場"]:.1f}</span>'
+            f'<span class="c-chg" style="color:{chg_col}">{sign}{chg:.0f}%</span>'
+            f'</div>'
+        )
+
+    if countdown:
+        axis_labels = ["-14分", "-10分", "-6分", "-2分", "開跑"]
+        sub_label = "全場・對齊開跑倒數軸"
+        head_label = "走勢（-14分 → 開跑）"
+    else:
+        axis_labels = ["開機", "", "經過時間", "", "現在"]
+        sub_label = "全場・開機後經過時間"
+        head_label = "走勢（開機 → 現在）"
+    axis = "".join(f"<span>{t}</span>" for t in axis_labels)
+    html = (
+        f'<div class="panel">'
+        f'<div class="panel-title">{pool_title}</div>'
+        f'<div class="panel-sub">{sub_label}</div>'
+        f'<div class="thead">'
+        f'<span class="c-no">馬號</span>'
+        f'<span class="c-spark">{head_label}</span>'
+        f'<span class="c-num">開賠</span>'
+        f'<span class="c-num">即場</span>'
+        f'<span class="c-chg">變化</span>'
+        f'</div>'
+        f'{"".join(rows_html)}'
+        f'<div class="axis"><span class="c-no"></span>'
+        f'<span class="axis-inner">{axis}</span>'
+        f'<span class="c-num"></span><span class="c-num"></span><span class="c-chg"></span></div>'
+        f'<div class="legend">'
+        f'<span><i style="background:{INFO}"></i>落飛（有錢入）</span>'
+        f'<span><i style="background:{DANGER}"></i>回飛（資金離場）</span>'
+        f'<span><i style="background:{MUTE}"></i>平穩</span>'
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+def rank_panel(df_pool, S, want_down, title, sub):
+    """want_down=True -> 落飛榜 (blue, odds dropped, pct<0);
+       want_down=False -> 回飛榜 (red, odds rose, pct>0)."""
+    color = INFO if want_down else DANGER
+    items = []
+    for _, r in df_pool.iterrows():
+        pct = r["變化"]  # negative = 落飛, positive = 回飛
+        if want_down and pct < -FLAT_THRESHOLD:
+            items.append((r["馬號"], abs(pct)))   # store magnitude
+        elif (not want_down) and pct > FLAT_THRESHOLD:
+            items.append((r["馬號"], abs(pct)))
+    items.sort(key=lambda t: t[1], reverse=True)
+    items = items[:6]
+    maxv = items[0][1] if items else 1.0
+
+    rows = []
+    for no, v in items:
+        w = max(4, v / maxv * 100)
+        sign = "-" if want_down else "+"
+        rows.append(
+            f'<div class="rank-row"><div class="rank-head">'
+            f'<span style="font-size:12px;font-weight:600">{no} 號</span>'
+            f'<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:{color}">{sign}{v:.0f}%</span>'
+            f'</div><div class="rank-bar"><div class="rank-fill" style="width:{w:.0f}%;background:{color}"></div></div></div>'
+        )
+    if not rows:
+        rows = ['<div style="font-size:11px;color:var(--muted);padding:8px 0">暫無</div>']
+    icon = "📉" if want_down else "📈"
+    html = (f'<div class="panel">'
+            f'<div class="panel-title">{icon} {title}</div>'
+            f'<div class="panel-sub">{sub}</div>{"".join(rows)}</div>')
+    st.markdown(html, unsafe_allow_html=True)
+
+def divergence_panel(df):
+    """Win moving but Place not (or vice versa)."""
+    win = df[df["池"] == "WIN"].set_index("馬號")
+    pla = df[df["池"] == "PLA"].set_index("馬號")
+    rows = []
+    for no in win.index:
+        if no not in pla.index:
+            continue
+        wc = win.loc[no, "變化"]
+        pc = pla.loc[no, "變化"]
+        w_move = abs(wc) > FLAT_THRESHOLD
+        p_move = abs(pc) > FLAT_THRESHOLD
+        if w_move and not p_move:
+            note = "只得獨贏有錢 — 博贏"
+            wlabel = f'獨贏 {wc:+.0f}%'
+            rows.append((no, wlabel, "位置 無變", note))
+        elif p_move and not w_move:
+            note = "只得位置有錢 — 博位置／each-way"
+            plabel = f'位置 {pc:+.0f}%'
+            rows.append((no, "獨贏 無變", plabel, note))
+
+    body = []
+    for no, wl, pl, note in rows[:8]:
+        body.append(
+            f'<div class="div-row">'
+            f'<span style="width:38px;font-weight:600">{no} 號</span>'
+            f'<span class="pill pill-win">{wl}</span>'
+            f'<span class="pill pill-mute">{pl}</span>'
+            f'<span style="color:var(--subtext)">{note}</span>'
+            f'</div>'
+        )
+    if not body:
+        body = ['<div style="font-size:11px;color:var(--muted);padding:8px 0">暫無背馳</div>']
+    html = (f'<div class="panel"><div class="panel-title">獨贏 / 位置 背馳</div>'
+            f'<div class="panel-sub">只得一個池有錢、另一個唔郁</div>{"".join(body)}</div>')
+    st.markdown(html, unsafe_allow_html=True)
+
+def _fmt_money(v):
+    """Format HKD compactly: $1.23M / $456K / $789."""
+    if v is None or v <= 0:
+        return "—"
+    if v >= 1_000_000:
+        return f"${v/1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"${v/1_000:.0f}K"
+    return f"${v:.0f}"
+
+def compute_scores(sub, S, pool_name, overround, other_pool_drops):
+    """Compute a 0-100 composite score per horse from independent signals.
+    Returns dict: 馬號 -> {surge, drop, water, agree, total}.
+    - surge (40): recent drop relative to field (how much it stands out now)
+    - drop  (30): absolute recent drop % level
+    - water (20): market maturity (overround near WATER_IDEAL)
+    - agree (10): both WIN & PLA dropping (cross-pool confirmation)
+    """
+    scores = {}
+    drops = sub["近30跌"].tolist()
+    max_drop = max(drops) if drops else 0.0
+    # water score is same for whole pool (depends on overround)
+    if overround <= WATER_IDEAL:
+        water = SCORE_WATER_MAX
+    elif overround >= WATER_LOOSE:
+        water = 0.0
+    else:
+        # linear between ideal (full) and loose (zero)
+        water = SCORE_WATER_MAX * (WATER_LOOSE - overround) / (WATER_LOOSE - WATER_IDEAL)
+
+    for _, r in sub.iterrows():
+        horse = r["馬號"]
+        d = r["近30跌"]
+        # surge (40): how this horse's drop compares to the strongest in field
+        surge = SCORE_SURGE_MAX * (d / max_drop) if max_drop > 0.5 and d > 0 else 0.0
+        # drop (30): absolute level, capped at SCORE_DROP_FULL %
+        drop = SCORE_DROP_MAX * min(1.0, d / SCORE_DROP_FULL) if d > 0 else 0.0
+        # agree (10): other pool for same horse also dropping (>= SURGE_MIN_DROP)
+        other_d = other_pool_drops.get(horse, 0.0)
+        agree = SCORE_AGREE_MAX if (d >= SURGE_MIN_DROP and other_d >= SURGE_MIN_DROP) else 0.0
+        total = surge + drop + water + agree
+        scores[horse] = {"surge": surge, "drop": drop, "water": water,
+                         "agree": agree, "total": total}
+    return scores
+
+def moneyflow_panel(df_pool, pool_name, pool_inv=None, S=None, mtp=None, other_pool_drops=None):
+    """Method A money flow + visual surge detection.
+    Adds: stake bar, ▲/🔥 surge highlight, surge-first sorting, 近30秒流入$.
+    'Surge' is detected purely by $ inflow in the last 30s (Method A, no time gate)."""
+    sub = df_pool[df_pool["即場"] > 0].copy()
+    if sub.empty:
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">💰 {pool_name}資金流向</div>'
+            f'<div class="panel-sub">暫無資料</div></div>', unsafe_allow_html=True)
+        return
+    # open-odds fallback: if 開賠 somehow 0/missing, use live so the horse still shows
+    sub["開賠"] = sub.apply(lambda r: r["開賠"] if r["開賠"] > 0 else r["即場"], axis=1)
+
+    # pool_name is the display name (獨贏/位置); the series is keyed by the
+    # pool CODE (WIN/PLA) held in the 池 column. Use the code for lookups.
+    pool_code = str(df_pool["池"].iloc[0]) if len(df_pool) else pool_name
+
+    inv_live = 1.0 / sub["即場"]
+    inv_open = 1.0 / sub["開賠"]
+    sub["即場佔比"] = inv_live / inv_live.sum() * 100.0
+    sub["開賠佔比"] = inv_open / inv_open.sum() * 100.0
+
+    # Market overround = Σ(1/odds). For WIN (1 winner) the fair baseline ~1.0.
+    # For PLACE there are multiple winning positions (usually 3, or 2 for small
+    # fields), so Σ(1/odds) naturally sums to ~n_place. Normalise by n_place so
+    # both pools compare against the same ~1.2 maturity baseline.
+    raw_overround = float(inv_live.sum())
+    if pool_code == "PLA":
+        n_runners = len(sub)
+        n_place = 2 if n_runners < 7 else 3   # HKJC: <7 runners -> 2 places
+        overround = raw_overround / n_place
+    else:
+        overround = raw_overround
+    implied_takeout = max(0.0, (1.0 - 1.0 / overround) * 100.0) if overround > 0 else 0.0
+
+    have_money = pool_inv is not None and pool_inv > 0
+    if have_money:
+        # 佔比法 (self-normalising) — proven most accurate as it absorbs the
+        # market's real takeout via Σ-normalisation (see derivation doc).
+        sub["投注額"] = sub["即場佔比"] / 100.0 * pool_inv
+        # Method B: true absolute stake change since first recorded point.
+        sub["投注變化"] = [stake_change_since_open(S, pool_code, no) if S is not None else 0.0
+                          for no in sub["馬號"]]
+    else:
+        # no pool money -> fall back to relative share change for direction only
+        sub["投注變化"] = sub["即場佔比"] - sub["開賠佔比"]
+
+    # ── recent odds-drop surge (近30秒賠率跌幅 %) — always-available signal ──
+    #   >= SURGE_BIG_DROP -> 🔥 大量湧入（level 2）
+    #   >= SURGE_MIN_DROP -> ▲ 急跌（level 1）
+    drops, surges = [], []
+    for _, r in sub.iterrows():
+        if S is not None:
+            drop_pct, _ = recent_speed(S, (pool_code, r["馬號"]), SURGE_WINDOW)  # +ve = dropped
+        else:
+            drop_pct = 0.0
+        drops.append(drop_pct)
+        if drop_pct >= SURGE_BIG_DROP:
+            surges.append(2)
+        elif drop_pct >= SURGE_MIN_DROP:
+            surges.append(1)
+        else:
+            surges.append(0)
+    sub["近30跌"] = drops
+    sub["surge"] = surges
+
+    # ── 綜合評分（100 分制）──
+    other_drops = other_pool_drops or {}
+    score_map = compute_scores(sub, S, pool_name, overround, other_drops)
+    sub["s_surge"] = [score_map[h]["surge"] for h in sub["馬號"]]
+    sub["s_drop"] = [score_map[h]["drop"] for h in sub["馬號"]]
+    sub["s_water"] = [score_map[h]["water"] for h in sub["馬號"]]
+    sub["s_agree"] = [score_map[h]["agree"] for h in sub["馬號"]]
+    sub["s_total"] = [score_map[h]["total"] for h in sub["馬號"]]
+
+    max_stake = sub["投注額"].max() if have_money else 0
+
+    # ── sort: by total score (highest confluence first) ──
+    sub = sub.sort_values(["s_total", "近30跌"], ascending=[False, False])
+
+    rows = []
+    for _, r in sub.iterrows():
+        chg = r["投注變化"]   # Method B: dollars (or % fallback if no money)
+        # direction threshold: $ mode uses a small $ floor; % mode uses 0.3
+        thresh = 1000.0 if have_money else 0.3
+        col = INFO if chg > thresh else (DANGER if chg < -thresh else MUTE)
+        surge = int(r["surge"])
+        faint = (surge == 0 and abs(chg) <= thresh)   # idle -> dim
+        name_col = "var(--muted)" if faint else "var(--text)"
+
+        # surge marker
+        if surge == 2:
+            marker = '<span style="color:#ff5757">🔥</span>'
+        elif surge == 1:
+            marker = '<span style="color:#ff5757">▲</span>'
+        else:
+            marker = ""
+
+        # stake bar (width relative to biggest stake)
+        if have_money and max_stake > 0:
+            w = max(2, r["投注額"] / max_stake * 100)
+            bar_col = "#ff5757" if surge == 2 else ("#e0a83c" if surge == 1 else INFO)
+            bar = (f'<span class="stake-barwrap"><span class="stake-bar" '
+                   f'style="width:{w:.0f}%;background:{bar_col};opacity:{0.45 if faint else 0.9}"></span></span>')
+        else:
+            bar = f'<span class="c-spark" style="color:var(--subtext);font-size:11px">{r["即場佔比"]:.1f}%</span>'
+
+        # recent drop cell — shows odds drop % in last 30s (always available)
+        drop = r["近30跌"]
+        if drop >= SURGE_BIG_DROP:
+            gain_cell = f'<span class="c-num" style="color:#ff5757;font-weight:700">🔥↓{drop:.1f}%</span>'
+        elif drop >= SURGE_MIN_DROP:
+            gain_cell = f'<span class="c-num" style="color:#e0a83c;font-weight:600">▲↓{drop:.1f}%</span>'
+        elif drop > 0.5:
+            gain_cell = f'<span class="c-num" style="color:var(--subtext)">↓{drop:.1f}%</span>'
+        else:
+            gain_cell = '<span class="c-num" style="color:var(--muted)">—</span>'
+
+        money_cell = (f'<span class="c-num" style="color:#e0a83c;font-weight:600">{_fmt_money(r["投注額"])}</span>'
+                      if have_money else "")
+
+        # 流向 cell — Method B shows $ change vs open; fallback shows %
+        if have_money:
+            flow_sign = "+" if chg > 0 else ("-" if chg < 0 else "")
+            flow_cell = f'<span class="c-chg" style="color:{col}">{flow_sign}{_fmt_money(abs(chg))}</span>'
+        else:
+            flow_sign = "+" if chg > 0.3 else ""
+            flow_cell = f'<span class="c-chg" style="color:{col}">{flow_sign}{chg:.1f}%</span>'
+
+        # ── 分數欄 ──
+        total = r["s_total"]
+        # total colour: high=red hot, mid=gold, low=grey
+        if total >= 70:
+            tcol, tweight = "#ff5757", "700"
+        elif total >= 40:
+            tcol, tweight = "#e0a83c", "600"
+        else:
+            tcol, tweight = "var(--muted)", "400"
+        breakdown = (f'<span style="font-size:9px;color:var(--muted)">'
+                     f'升{r["s_surge"]:.0f}/跌{r["s_drop"]:.0f}/水{r["s_water"]:.0f}/合{r["s_agree"]:.0f}</span>')
+        score_cell = (f'<span class="c-score">{breakdown} '
+                      f'<b style="color:{tcol};font-weight:{tweight};font-size:13px">{total:.0f}</b></span>')
+
+        row_cls = "row surge-gate" if surge == 2 else "row"
+        rows.append(
+            f'<div class="{row_cls}">'
+            f'<span class="c-no" style="color:{name_col}">{r["馬號"]}{marker}</span>'
+            f'{money_cell}'
+            f'{gain_cell}'
+            f'{flow_cell}'
+            f'{score_cell}'
+            f'</div>'
+        )
+
+    # water maturity light: green<1.25, yellow 1.25-1.35, red>1.35
+    if overround < 1.25:
+        wlight, wtext = "#22c55e", "賠率成熟·可信"
+    elif overround <= 1.35:
+        wlight, wtext = "#e0a83c", "接近成熟"
+    else:
+        wlight, wtext = "#ff5757", "未成熟·審慎"
+    water_badge = (f'<span style="color:{wlight}">●</span> 水位 {overround:.2f}（{wtext}）')
+
+    accuracy_note = "獨贏反推準確" if pool_name == "獨贏" else "位置為近似（多位分享）"
+    if have_money:
+        sub_label = (f'彩池總額 {_fmt_money(pool_inv)}　·　{water_badge}　·　{accuracy_note}<br>'
+                     f'分數＝升(40)+跌(30)+水(20)+合(10)　·　'
+                     f'🔥近30秒賠率跌≥{SURGE_BIG_DROP:.0f}%　▲≥{SURGE_MIN_DROP:.0f}%')
+        head = ('<span class="c-no">馬號</span>'
+                '<span class="c-num">投注額</span>'
+                '<span class="c-num">近30跌</span>'
+                '<span class="c-chg">流向$</span>'
+                '<span class="c-score">分項 / 總分</span>')
+    else:
+        sub_label = (f'用賠率反推佔比（彩池金額未取得）　·　{water_badge}<br>'
+                     f'分數＝升(40)+跌(30)+水(20)+合(10)')
+        head = ('<span class="c-no">馬號</span>'
+                '<span class="c-num">即場佔比</span>'
+                '<span class="c-num">近30跌</span>'
+                '<span class="c-score">分項 / 總分</span>')
+
+    html = (
+        f'<div class="panel">'
+        f'<div class="panel-title">💰 {pool_name}資金流向</div>'
+        f'<div class="panel-sub">{sub_label}</div>'
+        f'<div class="thead">{head}</div>'
+        f'{"".join(rows)}'
+        f'<div class="legend">'
+        f'<span><i style="background:#ff5757"></i>🔥賠率大跌 / ▲急跌（近30秒）</span>'
+        f'<span><i style="background:{INFO}"></i>資金流入</span>'
+        f'<span><i style="background:{MUTE}"></i>靜止</span>'
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+def stake_bar_chart(df_pool, pool_name, pool_inv, S):
+    """Horizontal bar chart: each horse's stake ($ = live-share × pool_inv).
+    Bars sorted by stake (largest first). Hot money (recent odds drop) tints the
+    bar and shows the inflow $; horses that EVER surged keep a small 🔥 memo."""
+    if pool_inv is None or pool_inv <= 0:
+        return
+    sub = df_pool[df_pool["即場"] > 0].copy()
+    if sub.empty:
+        return
+    pool_code = str(df_pool["池"].iloc[0]) if len(df_pool) else pool_name
+
+    inv_live = 1.0 / sub["即場"]
+    sub["即場佔比"] = inv_live / inv_live.sum() * 100.0
+    sub["投注額"] = sub["即場佔比"] / 100.0 * pool_inv
+
+    # recent drop% + recent $ inflow (30s) per horse
+    drops, inflows = [], []
+    for _, r in sub.iterrows():
+        dp, _ = recent_speed(S, (pool_code, r["馬號"]), SURGE_WINDOW) if S is not None else (0.0, 0.0)
+        drops.append(dp)
+        inflows.append(recent_stake_gain(S, pool_code, r["馬號"], SURGE_WINDOW) if S is not None else 0.0)
+        # remember peak drop ever (🔥 memory)
+        if S is not None and dp > 0:
+            key = (pool_code, r["馬號"])
+            prev = S["ever_surged"].get(key, 0.0)
+            if dp > prev:
+                S["ever_surged"][key] = dp
+    sub["近30跌"] = drops
+    sub["近30入"] = inflows
+
+    sub = sub.sort_values("投注額", ascending=False)
+    max_stake = sub["投注額"].max()
+
+    rows = []
+    for _, r in sub.iterrows():
+        horse = r["馬號"]
+        stake = r["投注額"]
+        drop = r["近30跌"]
+        inflow = r["近30入"]
+        w = max(2, stake / max_stake * 100) if max_stake > 0 else 2
+
+        hot_now = drop >= SURGE_MIN_DROP
+        big_now = drop >= SURGE_BIG_DROP
+        ever = S["ever_surged"].get((pool_code, horse), 0.0) if S is not None else 0.0
+
+        bar_col = "#ff5757" if big_now else ("#e0a83c" if hot_now else INFO)
+        # overlay label: show inflow $ when hot, else stake
+        if hot_now and inflow > 0:
+            overlay = f'🔥+{_fmt_money(inflow)}' if big_now else f'▲+{_fmt_money(inflow)}'
+            overlay_col = "#fff"
+        else:
+            overlay = ""
+        # ever-surged memo (small flame kept even after it cools)
+        memo = ''
+        if ever >= SURGE_BIG_DROP and not big_now:
+            memo = f'<span style="color:#ff5757;font-size:9px" title="曾大跌{ever:.0f}%">🔥</span>'
+        elif ever >= SURGE_MIN_DROP and not hot_now:
+            memo = f'<span style="color:#e0a83c;font-size:9px" title="曾急跌{ever:.0f}%">▲</span>'
+
+        rows.append(
+            f'<div style="display:flex;align-items:center;gap:8px;padding:3px 0">'
+            f'<span style="width:34px;flex:none;font-size:12px;font-weight:600;'
+            f'color:var(--text);font-family:JetBrains Mono,monospace">{horse}{memo}</span>'
+            f'<span style="flex:1;min-width:0;height:16px;background:rgba(255,255,255,0.05);'
+            f'border-radius:4px;overflow:hidden;display:flex;align-items:center;position:relative">'
+            f'<span style="display:block;height:100%;width:{w:.1f}%;background:{bar_col};'
+            f'opacity:0.85;border-radius:4px"></span>'
+            f'<span style="position:absolute;left:6px;font-size:9px;color:#fff;'
+            f'font-weight:600;text-shadow:0 0 3px rgba(0,0,0,0.8)">{overlay}</span>'
+            f'</span>'
+            f'<span style="width:56px;flex:none;text-align:right;font-size:11px;'
+            f'color:#e0a83c;font-weight:600;font-family:JetBrains Mono,monospace">'
+            f'{_fmt_money(stake)}</span>'
+            f'</div>'
+        )
+
+    html = (
+        f'<div class="panel">'
+        f'<div class="panel-title">📊 {pool_name}投注額棒型圖</div>'
+        f'<div class="panel-sub">棒長＝投注額（大到小排）· 熱錢流入時棒變色並標流入金額 · '
+        f'🔥/▲＝曾經爆過（記錄）</div>'
+        f'{"".join(rows)}'
+        f'<div class="legend">'
+        f'<span><i style="background:#ff5757"></i>🔥大量湧入</span>'
+        f'<span><i style="background:#e0a83c"></i>▲熱錢流入</span>'
+        f'<span><i style="background:{INFO}"></i>正常</span>'
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+def _nice_ceiling(maxv):
+    """自動揀靚頂 + 間格（1/2/2.5/5 × 10^n），目標約 5 格。"""
+    import math
+    if maxv <= 0:
+        return 100000, 20000
+    raw = maxv / 5.0
+    mag = 10 ** math.floor(math.log10(raw))
+    step = mag
+    for m in (1, 2, 2.5, 5, 10):
+        step = m * mag
+        if step >= raw:
+            break
+    top = math.ceil(maxv / step) * step
+    return int(top), int(step)
+
+def stake_bar_chart_v(df_pool, pool_name, pool_inv, S, sort_by="馬號",
+                      m1=100_000, m2=200_000, m3=400_000, mtp=None, as_of_ts=None):
+    """直向棒型圖：棒高＝估算投注額（賠率佔比 × 彩池總額）。
+    棒色＝最近一個完整分鐘流入（同每分鐘表 -1分格同步）。Y軸金額刻度（自動跟最大）。"""
+    if pool_inv is None or pool_inv <= 0:
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">📊 {pool_name}投注額棒型圖</div>'
+            f'<div class="panel-sub">暫無彩池金額</div></div>', unsafe_allow_html=True)
+        return
+    sub = df_pool[df_pool["即場"] > 0].copy()
+    if sub.empty:
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">📊 {pool_name}投注額棒型圖</div>'
+            f'<div class="panel-sub">有彩池金額 {_fmt_money(pool_inv)}，但未有逐匹馬賠率</div></div>',
+            unsafe_allow_html=True)
+        return
+    pool_code = str(df_pool["池"].iloc[0]) if len(df_pool) else pool_name
+    inv_live = 1.0 / sub["即場"]
+    sub["投注額"] = inv_live / inv_live.sum() * pool_inv   # 即場總投注（佔比法）
+    if sort_by == "賠率":
+        sub = sub.sort_values("即場")
+    else:
+        sub = sub.sort_values("馬號", key=lambda s: pd.to_numeric(s, errors="coerce"))
+    max_stake = sub["投注額"].max() if len(sub) else 1
+    top, step = _nice_ceiling(max_stake)
+
+    # 最近一個完整分鐘窗（同每分鐘表 -1分格一致）
+    now_ts = as_of_ts if as_of_ts is not None else datetime.now(HKT).timestamp()
+    m_end, m_start = now_ts, now_ts - 60
+
+    # Y軸刻度 HTML（絕對定位喺左邊）
+    PLOT_H = 130
+    yaxis = ""
+    t = 0
+    while t <= top:
+        y_px = int(t / top * PLOT_H) if top else 0
+        if t >= 1_000_000:
+            ylbl = f"{t/1_000_000:.1f}M"
+        elif t > 0:
+            ylbl = f"{int(t/1000)}K"
+        else:
+            ylbl = "0"
+        yaxis += (f'<div style="position:absolute;left:0;right:0;bottom:{y_px}px;'
+                  f'border-top:1px solid rgba(40,48,62,0.9);height:0">'
+                  f'<span style="position:absolute;left:0;top:-7px;font-size:8px;color:var(--muted);'
+                  f'font-family:JetBrains Mono,monospace">{ylbl}</span></div>')
+        t += step
+
+    bars = ""
+    for _, r in sub.iterrows():
+        horse = r["馬號"]
+        odds = r["即場"]
+        stake = r["投注額"]
+        # 棒色：最近一個完整分鐘流入（同每分鐘表同步）
+        inflow = latest_minute_gain(S, pool_code, horse, m_end) if S is not None else None
+        inflow = inflow or 0.0
+        if inflow >= m3:
+            bcol = "#c878ff"
+        elif inflow >= m2:
+            bcol = "#ff8c3c"
+        elif inflow >= m1:
+            bcol = "#ffd43b"
+        else:
+            bcol = INFO
+        PLOT_H = 130   # 繪圖區高度（px），棒用 px 計，唔用 % （% 會因為父層冇固定高而塌）
+        h_px = max(2, int(stake / top * PLOT_H)) if top > 0 else 2
+        inflow_lbl = (f'<div style="font-size:8px;color:{bcol};height:12px;text-align:center;white-space:nowrap">'
+                      f'{("+"+_fmt_money(inflow)) if inflow>=m1 else ""}</div>')
+        bars += (
+            f'<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;min-width:0">'
+            f'{inflow_lbl}'
+            f'<div style="width:70%;height:{h_px}px;background:{bcol};border-radius:3px 3px 0 0;'
+            f'opacity:0.9"></div>'
+            f'<div style="font-size:10px;color:var(--subtext);margin-top:3px;font-family:JetBrains Mono,monospace;line-height:1.1;text-align:center">'
+            f'{horse}<br><span style="font-size:8px;color:var(--muted)">{odds:g}</span></div>'
+            f'</div>'
+        )
+
+    html = (
+        f'<div class="panel">'
+        f'<div class="panel-title">📊 {pool_name}投注額棒型圖</div>'
+        f'<div class="panel-sub">棒高＝總投注金額（Y軸自動刻度）· 近1分鐘流入 ⚡{_fmt_money(m1)}黃/🔥{_fmt_money(m2)}橙/💥{_fmt_money(m3)}紫 變色（與金額表同步）</div>'
+        f'<div style="position:relative;padding-left:34px">'
+        f'<div style="position:absolute;left:0;right:0;bottom:26px;height:130px">{yaxis}</div>'
+        f'<div style="display:flex;align-items:flex-end;gap:3px;position:relative">{bars}</div>'
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
+                       m1=100_000, m2=200_000, m3=400_000,
+                       disk_race_key=None, as_of_ts=None):
+    """Per-minute actual stake inflow table (Excel-style).
+    Each row a horse, each column a countdown minute (-8..-1), cell = $ that
+    flowed into that horse that minute. Uses stake = pool×0.825/odds reversal.
+    Only shown when post time known (needs countdown minutes)."""
+    pool_inv = win_inv if pool == "WIN" else pla_inv
+    title = "獨贏" if pool == "WIN" else "位置"
+    if pool_inv is None or pool_inv <= 0:
+        return
+    sub = df[df["池"] == pool].copy()
+    sub = sub[sub["即場"] > 0]
+    if sub.empty:
+        return
+    if mtp is None:
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">📋 每分鐘落注金額表（{title}）</div>'
+            f'<div class="panel-sub">需要開跑時間先計倒數分鐘 — 請喺上方填開跑時間</div></div>',
+            unsafe_allow_html=True)
+        return
+
+    # ── 時間軸格仔（左＝早，右＝開跑）── v17.5：隔夜/當日 + 固定60/30/20/10 + 逐分鐘。
+    # 隔夜/當日嘅邊界用固定嘅 00:00（唔理個別場次開跑時間），解決 #6b：
+    # 同一日唔同場開跑時間唔同，但早段（隔夜/當日）理應完全一致。
+    post_ts = S["post_time"].timestamp() if S["post_time"] else None
+    post_dt_local = S["post_time"] if S["post_time"] else None
+
+    def edge_ts(min_before):
+        return post_ts - min_before * 60 if post_ts is not None else None
+
+    # 當日 00:00（固定，唔跟開跑時間浮動）
+    midnight_dt = datetime(post_dt_local.year, post_dt_local.month, post_dt_local.day,
+                           0, 0, 0, tzinfo=HKT) if post_dt_local else None
+    midnight_ts = midnight_dt.timestamp() if midnight_dt else None
+
+    # 逐格定義：(label, is_hour[早段/整點格,唔變色], ts_start, ts_end)
+    # 60/30/20/10：呢格代表「由呢個分鐘數開始，去到下一個刻度」嘅一段流入
+    #（例如「60」= 開跑前60分鐘 → 開跑前30分鐘 呢段）。10之後逐分鐘去到開跑。
+    ladder = [60, 30, 20, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+    cols = [
+        ("隔夜", True, False, None, midnight_ts),
+        ("當日", True, False, midnight_ts, edge_ts(60)),
+    ]
+    for i in range(len(ladder) - 1):
+        start_e, end_e = ladder[i], ladder[i + 1]
+        lbl = "開跑" if end_e == 0 else str(start_e)
+        is_hour = start_e >= 60   # 60呢格仲係大格,唔變色；30/20/10之後嘅逐分鐘格先變色
+        cols.append((lbl, is_hour, False, edge_ts(start_e), edge_ts(end_e)))
+
+    latest_end_ts = (as_of_ts if as_of_ts is not None
+                     else datetime.now(HKT).timestamp())
+    cols.append(("最新1分", False, True, latest_end_ts - 60, latest_end_ts))
+
+    def stake_bucket(horse, ts_start, ts_end):
+        if ts_end is None:
+            return None
+        if ts_start is None:
+            # 由最早記錄到 ts_end 嘅累積
+            s_end = stake_at_ts(S, pool, horse, ts_end)
+            hist = S["stake_hist"][(pool, str(horse))]
+            s_start = hist[0][1] if hist else None
+            if s_end is None or s_start is None:
+                return None
+            return s_end - s_start
+        if ts_end == latest_end_ts and ts_start == latest_end_ts - 60:
+            return latest_minute_gain(S, pool, horse, latest_end_ts)
+        return stake_in_bucket(S, pool, horse, ts_start, ts_end)
+
+    # 「隔夜」「當日」由硬碟計（唔受記憶體deque上限影響，開賣提前幾耐都啱）；
+    # 60/30/20/10同逐分鐘就用返記憶體（夠近，唔使拖硬碟）。
+    # disk_race_key：REPLAY 揀嗰場嘅 key（同上面下拉選單可能唔同場），
+    # 冇傳就用返 S 自己嗰個（LIVE 情況）。
+    race_key_now = disk_race_key or S.get("race_key")
+    early_map = (compute_early_buckets_from_disk(
+        race_key_now, pool, list(sub["馬號"]), midnight_ts, edge_ts(60),
+        as_of_ts=as_of_ts)
+        if race_key_now else {})
+
+    rows_data = []
+    for _, r in sub.sort_values("即場").iterrows():
+        horse = str(r["馬號"])
+        odds = r["即場"]
+        eb = early_map.get(horse, {})
+        per_col = [eb.get("隔夜"), eb.get("當日")]
+        per_col += [stake_bucket(horse, s, e) for (_, _, _, s, e) in cols[2:]]
+        rows_data.append((horse, odds, per_col))
+
+    def cellcol(v, is_hour):
+        if v is None:
+            return "var(--muted)"
+        if is_hour:
+            return "var(--subtext)"   # 早段/大格唔變色
+        if v >= m3: return "#c878ff"
+        if v >= m2: return "#ff8c3c"
+        if v >= m1: return "#ffd43b"
+        return "var(--subtext)"
+
+    # header
+    head = '<th style="text-align:left;padding:3px 5px;font-size:9px;color:var(--muted);position:sticky;left:0;background:var(--card)">馬 賠</th>'
+    for (lbl, is_hour, is_prev, _, _) in cols:
+        col_bg = "background:rgba(30,30,44,0.5);" if is_hour else ""
+        sync_head = 'border-left:2px solid rgba(80,170,255,0.55);' if is_prev else ''
+        head += (f'<th style="text-align:right;padding:2px 5px;font-size:9px;color:{"#78899a" if is_hour else "var(--muted)"};{col_bg}{sync_head}">'
+                 f'{lbl}</th>')
+    head += '<th style="text-align:right;padding:3px 5px;font-size:9px;color:#e0a83c">合計</th>'
+
+    body = ""
+    for horse, odds, per_col in rows_data:
+        # 合計 = 即場總投注（佔比法，同棒型圖棒高一致）
+        total = current_stake(S, pool, horse)
+        if total is None:
+            total = sum(v for v in per_col[:-1] if v) or 0
+        cells = ""
+        for (lbl, is_hour, is_prev, _, _), v in zip(cols, per_col):
+            txt = f'+{_fmt_money(v)}' if (v and v > 0) else ('—' if not v else _fmt_money(v))
+            bg = ''
+            if not is_hour and v:
+                if v >= m3: bg = 'background:rgba(200,120,255,0.15);'
+                elif v >= m2: bg = 'background:rgba(255,140,60,0.15);'
+                elif v >= m1: bg = 'background:rgba(255,212,59,0.12);'
+            sync_border = 'border-left:2px solid rgba(80,170,255,0.55);' if is_prev else ''
+            cells += f'<td style="text-align:right;padding:2px 5px;font-size:10px;color:{cellcol(v,is_hour)};{bg}{sync_border}font-family:JetBrains Mono,monospace">{txt}</td>'
+        body += (f'<tr><td style="padding:3px 5px;font-size:11px;color:var(--text);white-space:nowrap;position:sticky;left:0;background:var(--card)">'
+                 f'{horse} <span style="font-size:8px;color:var(--subtext)">{odds:g}</span></td>'
+                 f'{cells}'
+                 f'<td style="text-align:right;padding:3px 5px;font-size:10px;color:#e0a83c;font-weight:600;font-family:JetBrains Mono,monospace">{_fmt_money(total)}</td></tr>')
+
+    html = (
+        f'<div class="panel" style="overflow-x:auto">'
+        f'<div class="panel-title">📋 落注金額表（{title} · 時間由左到右）</div>'
+        f'<div class="panel-sub">隔夜(開賣→00:00) · 當日(00:00→-60分,全場一致) · '
+        f'60/30/20/10(每段) · 10分之後逐分鐘 → 開跑 · 最新1分＝畫面時間向前60秒 · '
+        f'⚡{_fmt_money(m1)}黃/🔥{_fmt_money(m2)}橙/💥{_fmt_money(m3)}紫（只臨場逐分鐘格變色）· 合計＝總投注（同棒型圖）</div>'
+        f'<table style="border-collapse:collapse;width:100%">'
+        f'<tr>{head}</tr>{body}</table>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+def combo_matrix_panel(matrix, pool_title, horses):
+    """Render a combination pool (QIN/QPL) as HKJC-style triangular matrix.
+    horses: sorted list of int horse numbers present in the race."""
+    if not matrix or not horses:
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">🎲 {pool_title}</div>'
+            f'<div class="panel-sub">暫無資料</div></div>', unsafe_allow_html=True)
+        return
+    hs = sorted(horses)
+    # find hottest (lowest odds) for highlight
+    min_odds = min(matrix.values()) if matrix else 0
+    # header row: horses[1:] as columns
+    cols = hs[1:]
+    rows_h = hs[:-1]
+
+    def cell(v, hot=False):
+        if v is None:
+            return '<td style="background:#3a4560;padding:3px"></td>'
+        bg = 'background:#c0392b;color:#fff;font-weight:600;' if hot else ''
+        return f'<td style="text-align:center;padding:3px;font-size:10px;{bg}">{v:g}</td>'
+
+    # build header
+    head = f'<td style="background:#1a2a4a;color:#9aa7b8;padding:3px;text-align:center;font-size:9px">{pool_title}</td>'
+    for c in cols:
+        head += f'<td style="background:#2a3550;padding:3px;text-align:center;color:#9aa7b8;font-size:10px">{c}</td>'
+
+    body = ""
+    for ri, rh in enumerate(rows_h):
+        row = f'<td style="background:#3a4560;text-align:center;padding:3px;color:#9aa7b8;font-size:10px">{rh}</td>'
+        for c in cols:
+            if c <= rh:
+                # left of diagonal: blank (or diagonal marker at c == next)
+                row += '<td style="background:#3a4560;padding:3px"></td>'
+            else:
+                pair = (rh, c)
+                odds = matrix.get(pair)
+                row += cell(odds, hot=(odds is not None and odds == min_odds))
+        body += f'<tr>{row}</tr>'
+
+    html = (
+        f'<div class="panel" style="overflow-x:auto">'
+        f'<div class="panel-title">🎲 {pool_title}</div>'
+        f'<div class="panel-sub">紅＝最熱組合（賠率最低 {min_odds:g}）· 交叉格＝該對馬賠率</div>'
+        f'<table style="border-collapse:collapse;width:100%">'
+        f'<tr>{head}</tr>{body}</table>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+def four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S,
+                         pool_totals, cold_odds=10.0, rise_thresh=0.5):
+    """Four-pool combined heat table with money + 1-min share-rise detection.
+    pool_totals: {'WIN':$, 'PLA':$, 'QIN':$, 'QPL':$} (QIN/QPL are estimates).
+    rise_thresh: flag a horse if its share rose >= this %pts in the last 60s."""
+    win = df[df["池"] == "WIN"].copy()
+    if win.empty:
+        return
+    inv = 1.0 / win["即場"]
+    win["W%"] = inv / inv.sum() * 100.0
+    win_share = {int(k): v for k, v in zip(win["馬號"], win["W%"])}
+
+    # record share history (for 1-min rise) — all four pools
+    for h, v in win_share.items():
+        record_share(S, "WIN", h, v)
+    for h, v in pla_part.items():
+        record_share(S, "PLA", h, v)
+    for h, v in qin_part.items():
+        record_share(S, "QIN", h, v)
+    for h, v in qpl_part.items():
+        record_share(S, "QPL", h, v)
+
+    def topN(part, n=3):
+        return set(sorted(part, key=lambda h: part[h], reverse=True)[:n]) if part else set()
+    top_win = topN(win_share)
+    top_pla = topN(pla_part)
+    top_qin = topN(qin_part)
+    top_qpl = topN(qpl_part)
+
+    wt = pool_totals.get("WIN") or 0
+    pt = pool_totals.get("PLA") or 0
+    qt = pool_totals.get("QIN") or 0
+    qpt = pool_totals.get("QPL") or 0
+    t1 = st.session_state.get("rise_t1", RISE_TIER1)
+    t2 = st.session_state.get("rise_t2", RISE_TIER2)
+    t3 = st.session_state.get("rise_t3", RISE_TIER3)
+
+    rows = []
+    for _, r in win.sort_values("即場").iterrows():
+        h = int(r["馬號"])
+        wo = r["即場"]
+        shares = {"WIN": r["W%"], "PLA": pla_part.get(h, 0.0),
+                  "QIN": qin_part.get(h, 0.0), "QPL": qpl_part.get(h, 0.0)}
+        tops = {"WIN": h in top_win, "PLA": h in top_pla,
+                "QIN": h in top_qin, "QPL": h in top_qpl}
+        nhot = sum(tops.values())
+        suspicious = (wo >= cold_odds) and nhot >= 3
+
+        # 1-min share rise across pools -> tiered
+        rises = {p: share_rise(S, p, h, 60) for p in ("WIN", "PLA", "QIN", "QPL")}
+        max_rise = max(rises.values()) if rises else 0.0
+        if max_rise >= t3:
+            tier, tier_col, tier_tag = 3, "#c878ff", "💥強烈"
+        elif max_rise >= t2:
+            tier, tier_col, tier_tag = 2, "#ff8c3c", "🔥明顯"
+        elif max_rise >= t1:
+            tier, tier_col, tier_tag = 1, "#ffd43b", "⚡留意"
+        else:
+            tier, tier_col, tier_tag = 0, "#5b6675", ""
+
+        # ── 記錄落 30分鐘訊號log（升級即記；同級每60秒先再記一次，唔會5秒refresh就洗版）──
+        last_tier_map = S.setdefault("_last_logged_tier", {})
+        last_ts_map = S.setdefault("_last_logged_ts", {})
+        prev_tier = last_tier_map.get(h, 0)
+        now_ts_sig = datetime.now(HKT).timestamp()
+        should_log = False
+        if tier > 0:
+            if tier > prev_tier or (now_ts_sig - last_ts_map.get(h, 0)) >= 60:
+                should_log = True
+        if should_log:
+            cause_pool = max(rises, key=rises.get)
+            event = {"ts": now_ts_sig, "horse": h, "pool": cause_pool,
+                     "tier": tier, "rise": round(max_rise, 2)}
+            S["signal_log"].append(event)
+            race_key_now = S.get("race_key")
+            if race_key_now:
+                try:
+                    append_signal_log(race_key_now, event)
+                except Exception:
+                    pass
+            last_tier_map[h] = tier
+            last_ts_map[h] = now_ts_sig
+        elif tier == 0:
+            last_tier_map[h] = 0
+
+        # pool % cells: all neutral grey (no green top-3)
+        def cell(pct):
+            return f'<span class="c-num" style="color:#9aa7b8">{pct:.1f}%</span>'
+
+        marker = ""
+        if suspicious:
+            marker = ' 💥可疑' if tier >= 3 else (' 🔥可疑' if tier >= 1 else ' 可疑')
+        elif tier > 0:
+            marker = f' {tier_tag}'
+
+        # row background by strongest signal
+        rowbg = ''
+        if suspicious:
+            rowbg = 'background:rgba(239,87,87,0.10);border-radius:4px;'
+        elif tier == 3:
+            rowbg = 'background:rgba(200,120,255,0.10);border-radius:4px;'
+        elif tier == 2:
+            rowbg = 'background:rgba(255,140,60,0.10);border-radius:4px;'
+        elif tier == 1:
+            rowbg = 'background:rgba(255,212,59,0.08);border-radius:4px;'
+
+        nhot_col = "#ff5757" if suspicious else "#5b6675"
+        rise_disp = f"+{max_rise:.1f}%" if max_rise >= 0.1 else "—"
+
+        rows.append(
+            f'<div class="row" style="{rowbg}">'
+            f'<span class="c-no" style="color:var(--text)">{h}'
+            f'<span style="font-size:9px;color:{"#ff5757" if suspicious else "#9aa7b8"}"> {wo:g}</span>'
+            f'<span style="font-size:9px;color:{tier_col}">{marker}</span></span>'
+            f'{cell(shares["WIN"])}{cell(shares["PLA"])}{cell(shares["QIN"])}{cell(shares["QPL"])}'
+            f'<span class="c-num" style="color:{tier_col};font-weight:600">{rise_disp}</span>'
+            f'<span class="c-num" style="color:{nhot_col};font-weight:600">{nhot}/4</span>'
+            f'</div>'
+        )
+
+    # money reference line: 直接將⚡/🔥/💥三級門檻（%）換算做各池實際觸發金額（$），
+    # 對應真正決定訊號嘅 share_rise() 門檻，唔使用戶自己攞「1%」再心算一次。
+    def tier_money(total, pct):
+        return _fmt_money(total * pct / 100.0) if total else "—"
+    money_ref = (
+        f'觸發金額對照（即場彩池 × 門檻%）：<br>'
+        f'⚡{t1:g}% 獨贏{tier_money(wt, t1)}/位置{tier_money(pt, t1)}/'
+        f'連贏{tier_money(qt, t1)}/位置Q{tier_money(qpt, t1)}<br>'
+        f'🔥{t2:g}% 獨贏{tier_money(wt, t2)}/位置{tier_money(pt, t2)}/'
+        f'連贏{tier_money(qt, t2)}/位置Q{tier_money(qpt, t2)}<br>'
+        f'💥{t3:g}% 獨贏{tier_money(wt, t3)}/位置{tier_money(pt, t3)}/'
+        f'連贏{tier_money(qt, t3)}/位置Q{tier_money(qpt, t3)}'
+        f'（連贏/位置Q金額為粗估）'
+    )
+
+    html = (
+        f'<div class="panel">'
+        f'<div class="panel-title">🎯 四池綜合熱度</div>'
+        f'<div class="panel-sub">按獨贏賠率排序 · 平時乾淨 · '
+        f'1分升 ⚡{t1:g}%/🔥{t2:g}%/💥{t3:g}% · 冷馬(≥{cold_odds:g}倍)多池皆熱＝可疑<br>{money_ref}</div>'
+        f'<div class="thead">'
+        f'<span class="c-no">馬 賠率</span>'
+        f'<span class="c-num">獨贏</span><span class="c-num">位置</span>'
+        f'<span class="c-num">連贏</span><span class="c-num">位置Q</span>'
+        f'<span class="c-num">1分升</span><span class="c-num">皆熱</span></div>'
+        f'{"".join(rows)}'
+        f'<div class="legend">'
+        f'<span><i style="background:#ffd43b"></i>⚡留意</span>'
+        f'<span><i style="background:#ff8c3c"></i>🔥明顯</span>'
+        f'<span><i style="background:#c878ff"></i>💥強烈</span>'
+        f'<span><i style="background:#ff5757"></i>冷馬皆熱可疑</span>'
+        f'</div></div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+def signal_summary_panel(events, minutes=30, as_of_ts=None):
+    """30分鐘訊號彙總（右邊新面板）：按馬分組，撳開睇逐行時序細節。
+    events: list of {ts,horse,pool,tier,rise}。as_of_ts=None 用而家時間；
+    REPLAY 模式會傳返嗰個snapshot嘅ts，等個30分鐘窗跟返翻睇緊嗰一刻。
+    用 st.container(border=True) 包住成個panel（連暫無訊號都喺border入面），
+    等個box可以自動stretch去到同左邊「四池綜合熱度」一樣高（CSS喺別處控制）。"""
+    if as_of_ts is None:
+        as_of_ts = datetime.now(HKT).timestamp()
+    cutoff = as_of_ts - minutes * 60
+    evs_in_window = [e for e in events if cutoff <= e.get("ts", 0) <= as_of_ts]
+
+    with st.container(border=True):
+        st.markdown(
+            f'<div class="panel-title">🕐 {minutes}分鐘訊號彙總</div>'
+            f'<div class="panel-sub">按馬分組 · 撳隻馬展開時序細節 · 過咗{minutes}分鐘自動移除</div>',
+            unsafe_allow_html=True)
+
+        if not evs_in_window:
+            st.caption("暫無訊號")
+            return
+
+        by_horse = defaultdict(list)
+        for e in evs_in_window:
+            by_horse[e["horse"]].append(e)
+
+        tier_emoji = {1: "⚡", 2: "🔥", 3: "💥"}
+
+        def horse_key(h):
+            evs = by_horse[h]
+            return (-max(ev["tier"] for ev in evs), -max(ev["ts"] for ev in evs))
+
+        for h in sorted(by_horse.keys(), key=horse_key):
+            evs = sorted(by_horse[h], key=lambda e: e["ts"], reverse=True)
+            counts = {1: 0, 2: 0, 3: 0}
+            for e in evs:
+                counts[e["tier"]] = counts.get(e["tier"], 0) + 1
+            summary = "　".join(f'{tier_emoji[t]}×{counts[t]}' for t in (3, 2, 1) if counts.get(t))
+            with st.expander(f"{h}號　{summary}", expanded=False):
+                for e in evs:
+                    t_str = datetime.fromtimestamp(e["ts"], HKT).strftime("%H:%M:%S")
+                    st.markdown(
+                        f'<div style="display:flex;gap:8px;font-size:11px;padding:2px 0">'
+                        f'<span style="color:var(--muted);width:56px">{t_str}</span>'
+                        f'<span style="color:var(--subtext);width:36px">{e["pool"]}</span>'
+                        f'<span style="color:var(--text)">{tier_emoji.get(e["tier"], "")} +{e["rise"]:.1f}%</span>'
+                        f'</div>', unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════════
+#  HEADER + CONTROLS
+# ════════════════════════════════════════════════════════════
+st.markdown(
+    f'<div class="hdr"><div class="hdr-title">🐎 {APP_NAME}</div>'
+    f'<span class="live"><span class="live-dot"></span>實時 · 5秒</span></div>',
+    unsafe_allow_html=True)
+
+# ── 資料來源 + 模式：合併一列，置頂（決定成個畫面點運作嘅最頂層開關）──
+st.markdown('<div style="font-size:12px;color:var(--subtext);margin:4px 0 2px">📡 資料來源　　　⏱️ 模式</div>',
+            unsafe_allow_html=True)
+_src_col, _sep_col, _mode_col = st.columns([2.4, 0.1, 2])
+with _src_col:
+    data_src = st.radio("資料來源", ["💾 雲端記錄（讀硬碟·快）", "🌐 直接連線（拉HKJC）"],
+                        horizontal=True, label_visibility="collapsed", key="data_src")
+    use_disk = "雲端" in data_src
+with _mode_col:
+    mode = st.radio("模式", ["● LIVE 即場", "🔁 REPLAY 翻睇"], horizontal=True,
+                    label_visibility="collapsed", key="mode_toggle")
+replay_mode = "REPLAY" in mode
+replay_snaps = None
+replay_idx = None
+
+# ── #8：自動同步馬會賽期（列出所有有賽事嘅日期+場地，包括海外）──
+if "meetings_cache" not in st.session_state:
+    st.session_state.meetings_cache = []
+    st.session_state.meetings_cache_ts = None
+_mnow = datetime.now(HKT)
+if (st.session_state.meetings_cache_ts is None
+        or (_mnow - st.session_state.meetings_cache_ts).total_seconds() >= 300):
+    try:
+        st.session_state.meetings_cache = fetch_all_meetings()
+    except Exception:
+        st.session_state.meetings_cache = []
+    st.session_state.meetings_cache_ts = _mnow
+_meetings = st.session_state.meetings_cache or []
+
+c1, c2, c3, c4, c5 = st.columns([2.4, 1, 1, 1.4, 1.4])
+with c1:
+    if _meetings:
+        opts = [f"{m['date']} · {venue_label(m['venue'])} ({m['venue']}) · {m['n_races']}場"
+                for m in _meetings]
+        # default: 最接近今日嘅賽事
+        _today = datetime.now(HKT).date().isoformat()
+        _def = 0
+        for i, m in enumerate(_meetings):
+            if m["date"] >= _today:
+                _def = i
+                break
+        pick_idx = st.selectbox("賽事（自動同步馬會）", range(len(opts)),
+                                format_func=lambda i: opts[i], index=_def)
+        _sel = _meetings[pick_idx]
+        race_date = datetime.strptime(_sel["date"], "%Y-%m-%d").date()
+        course = _sel["venue"]
+        _max_race = max(1, _sel["n_races"] or 14)
+    else:
+        st.warning("暫時攞唔到馬會賽期，用手動揀")
+        race_date = st.date_input("日期", datetime.now(HKT).date())
+        course = "ST"
+        _max_race = 14
+with c2:
+    if not _meetings:
+        course = st.selectbox("場地", ["ST", "HV"],
+                              format_func=lambda x: f"{venue_label(x)} {x}")
+    else:
+        st.markdown(f'<div style="font-size:9px;color:var(--subtext);margin-top:6px">場地</div>'
+                    f'<div style="font-size:14px;color:var(--text);font-weight:600">'
+                    f'{venue_label(course)} {course}</div>', unsafe_allow_html=True)
+with c3:
+    race_no = st.number_input("場次", 1, int(_max_race), 1)
+with c4:
+    post_input = st.text_input("開跑時間 (可選)", value="", placeholder="自動/可覆蓋",
+                               help="讀硬碟模式會自動攞開跑時間。想手動覆蓋先填 HH:MM。")
+with c5:
+    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    reset_clicked = st.button("🔄 重設此場走勢", use_container_width=True)
+
+# 敏感度設定（可摺疊，唔阻主畫面）
+with st.expander("⚙️ 急升偵測敏感度（分層 · 拉桿微調）"):
+    def _clampf(v, lo, hi, fallback):
+        """同 _clamp 一樣，但處理浮點數（四池熱度用%）。"""
+        try:
+            v = float(v)
+        except Exception:
+            return fallback
+        return max(lo, min(hi, v))
+
+    st.markdown('<div style="font-size:11px;color:var(--subtext);margin-bottom:2px">四池熱度（佔比 %）</div>', unsafe_allow_html=True)
+    sc1, sc2, sc3 = st.columns(3)
+    with sc1:
+        st.session_state["rise_t1"] = st.slider(
+            "⚡ 留意（%）", 0.2, 2.0,
+            _clampf(st.session_state.get("rise_t1", RISE_TIER1), 0.2, 2.0, RISE_TIER1), 0.1)
+    with sc2:
+        st.session_state["rise_t2"] = st.slider(
+            "🔥 明顯（%）", 0.3, 2.5,
+            _clampf(st.session_state.get("rise_t2", RISE_TIER2), 0.3, 2.5, RISE_TIER2), 0.1)
+    with sc3:
+        st.session_state["rise_t3"] = st.slider(
+            "💥 強烈（%）", 0.5, 3.0,
+            _clampf(st.session_state.get("rise_t3", RISE_TIER3), 0.5, 3.0, RISE_TIER3), 0.1)
+
+    st.markdown('<div style="font-size:11px;color:var(--subtext);margin:8px 0 2px">金額訊號（棒型圖 + 每分鐘金額表）· 千元（輸入數值，撳「儲存設定」先會跨session記住）</div>', unsafe_allow_html=True)
+
+    def _clamp(v, lo, hi, fallback):
+        """舊session_state / 舊settings檔可能存住超出新範圍嘅值（例如舊版拉桿
+        set過100K，但新⚡上限得50K），直接傳落 number_input 會令 Streamlit 拋
+        StreamlitValueAboveMaxError。呢度統一夾返入合法範圍先用。"""
+        try:
+            v = int(v)
+        except Exception:
+            return fallback
+        return max(lo, min(hi, v))
+
+    mc1, mc2, mc3, mc4 = st.columns([1, 1, 1, 0.9])
+    with mc1:
+        _mk1 = st.number_input("⚡ 留意（1-50 K）", min_value=1, max_value=50, step=1,
+                               value=_clamp(st.session_state.get("money_t1_k", 20), 1, 50, 20))
+    with mc2:
+        _mk2 = st.number_input("🔥 明顯（51-100 K）", min_value=51, max_value=100, step=1,
+                               value=_clamp(st.session_state.get("money_t2_k", 70), 51, 100, 70))
+    with mc3:
+        _mk3 = st.number_input("💥 強烈（101-400 K）", min_value=101, max_value=400, step=1,
+                               value=_clamp(st.session_state.get("money_t3_k", 150), 101, 400, 150))
+    with mc4:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if st.button("💾 儲存設定", use_container_width=True):
+            _ok = save_settings({
+                "money_t1_k": _mk1, "money_t2_k": _mk2, "money_t3_k": _mk3,
+                "rise_t1": st.session_state.get("rise_t1", RISE_TIER1),
+                "rise_t2": st.session_state.get("rise_t2", RISE_TIER2),
+                "rise_t3": st.session_state.get("rise_t3", RISE_TIER3),
+            })
+            st.session_state["_settings_saved_at"] = datetime.now(HKT).strftime("%H:%M:%S")
+            st.session_state["_settings_save_ok"] = _ok
+
+    # 呢3個數值即刻生效（唔使撳儲存都會即場用到），儲存淨係影響「下次開app」嘅預設值
+    st.session_state["money_t1_k"] = _mk1
+    st.session_state["money_t2_k"] = _mk2
+    st.session_state["money_t3_k"] = _mk3
+    st.session_state["money_t1"] = _mk1 * 1000
+    st.session_state["money_t2"] = _mk2 * 1000
+    st.session_state["money_t3"] = _mk3 * 1000
+
+    if st.session_state.get("_settings_saved_at"):
+        _status = "已儲存" if st.session_state.get("_settings_save_ok") else "⚠️ 儲存失敗（check硬碟權限）"
+        st.caption(f"{_status}：{st.session_state['_settings_saved_at']}　· 下次開app會自動讀返呢啲數值")
+
+    st.caption("四池熱度用佔比%；棒型圖+金額表用實質金額（近1分鐘估算落注），兩個金額表完美同步。低＝多提示、高＝少但精。")
+
+if replay_mode:
+    saved = list_saved_races()
+    if not saved:
+        st.info("暫時未有已儲存嘅場次記錄。開住一場（有彩池數據）幾分鐘，佢會每 30 秒自動記低，之後就可以喺呢度揀返翻睇。")
+    else:
+        pick = st.selectbox("揀場次", saved, index=len(saved) - 1)
+        st.session_state["_replay_pick"] = pick
+        replay_snaps = load_snapshots(pick)
+        if replay_snaps:
+            n = len(replay_snaps)
+            # 時間軸滑桿本身（連同快捷跳點）搬咗去落面「棒型圖」上面先真正
+            # render；呢度淨係讀/初始化返個值，等成頁計算(df/mtp/stake_hist等)
+            # 用得到。用 session_state key 令個值可以「早讀、遲畫」。
+            if "replay_idx_slider" not in st.session_state:
+                st.session_state["replay_idx_slider"] = n - 1
+            st.session_state["replay_idx_slider"] = min(st.session_state["replay_idx_slider"], n - 1)
+            replay_idx = st.session_state["replay_idx_slider"]
+        else:
+            st.info("呢場冇記錄點")
+
+# ════════════════════════════════════════════════════════════
+#  ACTIVE CONTEXT — LIVE 同 REPLAY 各有自己一套，唔共用、唔互相污染
+# ════════════════════════════════════════════════════════════
+# 概念：成個 dashboard 只係一套顯示邏輯，由呢三個變數決定睇咩：
+#   ACTIVE_RACE_KEY  = 而家睇緊邊一場
+#   ACTIVE_POST_TIME = 嗰場嘅開跑時間
+#   ACTIVE_NOW_TS    = 睇緊邊一刻（LIVE＝而家；REPLAY＝時間軸揀嗰刻）
+# 落面所有 panel（棒型圖／落注表／四池熱度／訊號）一律用呢三個，
+# 唔再各自讀 S["race_key"] / S["post_time"]，亦唔再分 LIVE / REPLAY 寫兩套。
+LIVE_RACE_KEY = f"{race_date}|{course}|{race_no}"
+
+if replay_mode and replay_snaps:
+    # REPLAY 用自己一套 state（key 加前綴），行落去點改都唔會影響 LIVE 嗰場記憶
+    ACTIVE_RACE_KEY = st.session_state.get("_replay_pick") or LIVE_RACE_KEY
+    S = get_state("REPLAY::" + ACTIVE_RACE_KEY)
+    S["race_key"] = ACTIVE_RACE_KEY
+    # 開跑時間由 REPLAY 嗰場自己嘅 snapshot 取眾數（見 post_time_from_snaps
+    # 嘅註解：唔可以攞最後一個，recorder 偶然會寫入異常值）。
+    _rpt = post_time_from_snaps(replay_snaps)
+    ACTIVE_POST_TIME = datetime.fromtimestamp(_rpt, HKT) if _rpt else None
+    ACTIVE_NOW_TS = (replay_snaps[replay_idx].get("ts")
+                     if replay_idx is not None and replay_idx < len(replay_snaps) else None)
+else:
+    ACTIVE_RACE_KEY = LIVE_RACE_KEY
+    if reset_clicked:
+        S = reset_state(LIVE_RACE_KEY)
+    else:
+        S = get_state(LIVE_RACE_KEY)
+    _source_key = f"_last_use_disk_{LIVE_RACE_KEY}"
+    if use_disk and st.session_state.get(_source_key) is False:
+        S = reset_state(LIVE_RACE_KEY)
+    st.session_state[_source_key] = use_disk
+    ACTIVE_POST_TIME = None      # 下面由 manual_post / 硬碟 snapshot 決定
+    ACTIVE_NOW_TS = None         # None ＝ 用「而家」
+
+# 為咗兼容舊 code，race_key 繼續指住「而家睇緊嗰場」
+race_key = ACTIVE_RACE_KEY
+
+# 轉場次 / 重新揀返呢場之後，由硬碟補返記憶體漏咗嘅歷史（REPLAY 自己會
+# 由 snapshot 完整重建，唔使呢步；只在 LIVE 先做）。
+if not replay_mode:
+    try:
+        sync_state_from_disk(race_key, S)
+    except Exception:
+        pass
+    try:
+        sync_signal_log_from_disk(race_key, S)
+    except Exception:
+        pass
+
+# Manual override (optional). If filled, it wins over auto post time.
+manual_post = None
+if post_input.strip():
+    try:
+        hh, mm = post_input.strip().split(":")
+        manual_post = datetime(race_date.year, race_date.month, race_date.day,
+                               int(hh), int(mm), 0, tzinfo=HKT)
+    except Exception:
+        manual_post = None
+
+
+# ════════════════════════════════════════════════════════════
+#  REPLAY STATE REBUILD — must happen BEFORE enrich/render
+# ════════════════════════════════════════════════════════════
+def rebuild_replay_state(snaps, replay_idx, S):
+    """Rebuild all in-memory history strictly up to the selected snapshot.
+    This keeps open odds, recent odds movement, stake history and share history
+    on the same historical clock.
+    """
+    S["series"] = defaultdict(lambda: deque(maxlen=400))
+    S["stake_hist"] = defaultdict(lambda: deque(maxlen=400))
+    S["share_hist"] = defaultdict(lambda: deque(maxlen=400))
+    S["open_odds"] = {}
+    if not snaps or replay_idx is None:
+        return
+    for si in range(replay_idx + 1):
+        sp = snaps[si]
+        ts = sp.get("ts")
+        if ts is None:
+            continue
+        pinv = sp.get("pool") or {}
+        for pool_code, odds_map in (("WIN", sp.get("win")), ("PLA", sp.get("pla"))):
+            if not odds_map:
+                continue
+            valid = []
+            for h, raw_o in odds_map.items():
+                try:
+                    o = float(raw_o)
+                except Exception:
+                    continue
+                if o > 0:
+                    valid.append((str(h), o))
+            if not valid:
+                continue
+            inv_sum = sum(1.0 / o for _, o in valid)
+            ptot = pinv.get(pool_code)
+            for h, o in valid:
+                key = (pool_code, h)
+                S["series"][key].append((ts, o))
+                if key not in S["open_odds"]:
+                    S["open_odds"][key] = o
+                if ptot and inv_sum > 0:
+                    share = (1.0 / o) / inv_sum
+                    S["stake_hist"][key].append((ts, share * ptot))
+                    S["share_hist"][(pool_code, h)].append((ts, share * 100.0))
+
+# ════════════════════════════════════════════════════════════
+#  FETCH + PROCESS
+# ════════════════════════════════════════════════════════════
+# Sliding window: current race + next 2 (capped at race 14)
+window = [n for n in range(int(race_no), int(race_no) + 3) if 1 <= n <= _max_race]
+
+# Fetch + record the *background* races first (not the current one).
+# Small spacing between calls avoids hammering HKJC.
+# 讀硬碟模式唔使拉 HKJC（recorder 已經背景記緊）
+if not use_disk:
+    for bg_no in window:
+        if bg_no == int(race_no):
+            continue
+        bg_key = f"{race_date}|{course}|{bg_no}"
+        bg_state = get_state(bg_key)
+        try:
+            bg_pools = fetch_race(str(race_date), course, bg_no)
+            record_into_state(bg_pools, bg_state)
+        except Exception:
+            pass
+        _time.sleep(0.15)
+
+# Now fetch the current (displayed) race
+if use_disk:
+    pools = []      # 下面用 disk snapshot 重建
+else:
+    try:
+        pools = fetch_race(str(race_date), course, int(race_no))
+    except Exception as e:
+        st.error(f"⚠️ 連線失敗：{e}")
+        pools = []
+
+# Pool turnover (彩池金額) — cached, refreshed at most every 10s so it never
+# slows the 5s odds cycle. If it fails, money flow falls back to percentage.
+if "turnover_cache" not in st.session_state:
+    st.session_state.turnover_cache = {}
+    st.session_state.turnover_cache_ts = None
+    st.session_state.turnover_cache_key = None
+_tkey = f"{race_date}|{course}"
+_tnow = datetime.now(HKT)
+_need = (st.session_state.turnover_cache_key != _tkey
+         or st.session_state.turnover_cache_ts is None
+         or (_tnow - st.session_state.turnover_cache_ts).total_seconds() >= 10)
+if _need and not use_disk:
+    try:
+        st.session_state.turnover_cache = fetch_turnover(str(race_date), course)
+    except Exception:
+        st.session_state.turnover_cache = {}
+    st.session_state.turnover_cache_ts = _tnow
+    st.session_state.turnover_cache_key = _tkey
+turnover_map = st.session_state.turnover_cache or {}
+this_inv = turnover_map.get(int(race_no), {})
+win_inv = this_inv.get("WIN")
+pla_inv = this_inv.get("PLA")
+
+# Fetch QIN (連贏) + QPL (位置Q) odds for this race (only oddsTypes var changes,
+# query string unchanged -> whitelist-safe). Kept separate from WIN/PLA flow.
+if use_disk:
+    combo_pools = []
+else:
+    try:
+        combo_pools = fetch_combo(str(race_date), course, int(race_no))
+    except Exception:
+        combo_pools = []
+qin_matrix = combo_to_matrix(combo_pools, "QIN")
+qpl_matrix = combo_to_matrix(combo_pools, "QPL")
+qin_part = combo_participation(qin_matrix)
+qpl_part = combo_participation(qpl_matrix)
+
+# ── Post time：LIVE 同 REPLAY 都自動攞，手動輸入任何時候都最大 ──
+# REPLAY：喺 ACTIVE CONTEXT 由嗰場 snapshot 取眾數攞好。
+# LIVE 讀硬碟：由嗰場所有 snapshot 取眾數（唔再攞最新一個，避免雜值）。
+# LIVE 直接連線：由 turnover API 嘅 postTime 攞（之前 AUTO DISABLED，
+#   而家開返；如果自動攞到嘅值唔啱，手動填就會蓋過佢）。
+_auto_post = None
+if replay_mode:
+    _auto_post = ACTIVE_POST_TIME
+else:
+    if use_disk:
+        _auto_post = post_time_for_race(ACTIVE_RACE_KEY)
+    else:
+        _pt_raw = (turnover_map.get(int(race_no)) or {}).get("post")
+        _auto_post = parse_post_time(_pt_raw) if _pt_raw else None
+        # 直接連線攞唔到就退返去硬碟記錄（recorder 背景一直記緊）
+        if _auto_post is None:
+            _auto_post = post_time_for_race(ACTIVE_RACE_KEY)
+
+S["post_time"] = manual_post or _auto_post
+ACTIVE_POST_TIME = S["post_time"]
+
+df = pools_to_df(pools)
+
+# ── 讀硬碟 LIVE：用最新 snapshot 重建（唔拉 HKJC，快、自動開跑時間）──
+LATEST_MINUTE_TS = ACTIVE_NOW_TS
+if use_disk and not replay_mode:
+    _snap = load_latest_snapshot(race_key)
+    if _snap:
+        LATEST_MINUTE_TS = _snap.get("ts")
+        rows_d = []
+        for h, o in (_snap.get("win") or {}).items():
+            rows_d.append({"池": "WIN", "馬號": h, "賠率": float(o), "大熱": False})
+        for h, o in (_snap.get("pla") or {}).items():
+            rows_d.append({"池": "PLA", "馬號": h, "賠率": float(o), "大熱": False})
+        df = pd.DataFrame(rows_d)
+        _pp = _snap.get("pool") or {}
+        win_inv = _pp.get("WIN"); pla_inv = _pp.get("PLA")
+        this_inv = {"WIN": _pp.get("WIN"), "PLA": _pp.get("PLA"),
+                    "QIN": _pp.get("QIN"), "QPL": _pp.get("QPL")}
+        qin_matrix = {tuple(int(x) for x in k.split(",")): v
+                      for k, v in (_snap.get("qin") or {}).items()}
+        qpl_matrix = {tuple(int(x) for x in k.split(",")): v
+                      for k, v in (_snap.get("qpl") or {}).items()}
+        qin_part = combo_participation(qin_matrix)
+        qpl_part = combo_participation(qpl_matrix)
+        # post_time 已經喺上面統一處理（取眾數），呢度唔再覆寫
+    else:
+        st.info("💾 雲端記錄模式：呢場暫時未有記錄（recorder 開賣後會自動記）。想即刻睇可揀「🌐 直接連線」。")
+
+
+# ── REPLAY 覆蓋：用揀咗嘅 snapshot 重建數據（唔用即場）──
+if replay_mode and replay_snaps and replay_idx is not None:
+    snap = replay_snaps[replay_idx]
+    rows_r = []
+    for h, o in (snap.get("win") or {}).items():
+        rows_r.append({"池": "WIN", "馬號": h, "賠率": float(o), "大熱": False})
+    for h, o in (snap.get("pla") or {}).items():
+        rows_r.append({"池": "PLA", "馬號": h, "賠率": float(o), "大熱": False})
+    df = pd.DataFrame(rows_r)
+    _p = snap.get("pool") or {}
+    win_inv = _p.get("WIN"); pla_inv = _p.get("PLA")
+    this_inv = {"WIN": _p.get("WIN"), "PLA": _p.get("PLA"),
+                "QIN": _p.get("QIN"), "QPL": _p.get("QPL")}
+    qin_matrix = {tuple(int(x) for x in k.split(",")): v for k, v in (snap.get("qin") or {}).items()}
+    qpl_matrix = {tuple(int(x) for x in k.split(",")): v for k, v in (snap.get("qpl") or {}).items()}
+    qin_part = combo_participation(qin_matrix)
+    qpl_part = combo_participation(qpl_matrix)
+    # post_time 已經喺 ACTIVE CONTEXT 由呢場自己嘅 snapshot 設定好，唔使再覆寫
+
+if df.empty:
+    st.markdown(
+        '<div class="panel empty"><div style="font-size:2rem">🏁</div>'
+        '<div style="font-size:1rem;margin-top:6px">暫時未有即時賠率</div>'
+        '<div style="font-size:12px;color:var(--muted);margin-top:4px">'
+        '可能彩池未開、賽事已完、或暫時無法取得</div></div>',
+        unsafe_allow_html=True)
+    with st.expander("🔧 診斷 — 查看 API 原始回應"):
+        try:
+            dbg_payload = {"operationName": "racing",
+                           "variables": {"date": str(race_date), "venueCode": course,
+                                         "raceNo": int(race_no), "oddsTypes": ["WIN", "PLA"]},
+                           "query": RACING_QUERY}
+            dbg = requests.post(API, headers=HEADERS, json=dbg_payload, timeout=20)
+            st.write(f"HTTP status: {dbg.status_code}")
+            st.json(dbg.json())
+        except Exception as e:
+            st.write(f"Request error: {e}")
+else:
+    # REPLAY history MUST be rebuilt before enrich so "開賠 / 變化 / 近30跌"
+    # all use the selected historical point. LIVE continues recording normally.
+    if replay_mode and replay_snaps and replay_idx is not None:
+        rebuild_replay_state(replay_snaps, replay_idx, S)
+        df, mtp = enrich(df, S, as_of_ts=ACTIVE_NOW_TS, record=False)
+        if ACTIVE_POST_TIME is not None:
+            mtp = (ACTIVE_NOW_TS - ACTIVE_POST_TIME.timestamp()) / 60.0
+        else:
+            mtp = None
+    else:
+        df, mtp = enrich(df, S, record=not use_disk)
+        # Record current stake ($) per horse for surge detection (only when pool known)
+        if not use_disk:
+            record_stakes(df[df["池"] == "WIN"], "WIN", win_inv, S)
+            record_stakes(df[df["池"] == "PLA"], "PLA", pla_inv, S)
+
+        # ── 寫硬碟 snapshot（每 30 秒一次）──
+        _snap_key = f"_last_snap_{race_key}"
+        _now_epoch = datetime.now(HKT).timestamp()
+        _last_snap = st.session_state.get(_snap_key, 0)
+        if not use_disk and _now_epoch - _last_snap >= SNAPSHOT_INTERVAL:
+            try:
+                snap = {
+                    "ts": _now_epoch,
+                    "race_key": race_key,
+                    "post_time": S["post_time"].timestamp() if S["post_time"] else None,
+                    "win": {str(r["馬號"]): r["即場"] for _, r in df[df["池"] == "WIN"].iterrows()},
+                    "pla": {str(r["馬號"]): r["即場"] for _, r in df[df["池"] == "PLA"].iterrows()},
+                    "pool": {"WIN": win_inv, "PLA": pla_inv,
+                             "QIN": this_inv.get("QIN"), "QPL": this_inv.get("QPL")},
+                    "qin": {f"{a},{b}": o for (a, b), o in qin_matrix.items()},
+                    "qpl": {f"{a},{b}": o for (a, b), o in qpl_matrix.items()},
+                }
+                save_snapshot(race_key, snap)
+                st.session_state[_snap_key] = _now_epoch
+            except Exception:
+                pass
+
+    # ── post-time / countdown status line ──
+    if S["post_time"] is not None and mtp is not None:
+        src = "手動" if manual_post is not None else "自動抓取"
+        if mtp < 0:
+            secs_left = abs(mtp) * 60
+            if secs_left <= 60:
+                cd = f"距離開跑 {secs_left:.0f} 秒　🔥入閘窗"
+            else:
+                cd = f"距離開跑 {abs(mtp):.0f} 分鐘"
+        else:
+            cd = "已開跑 / 封盤"
+        pt_label = S["post_time"].strftime("%H:%M")
+        st.markdown(
+            f'<div style="font-family:JetBrains Mono,monospace;font-size:11px;color:var(--subtext);'
+            f'margin-bottom:8px">開跑時間 {pt_label}（{src}）· {cd} · 實時跟蹤中</div>',
+            unsafe_allow_html=True)
+    else:
+        elapsed = ""
+        if S["started_at"]:
+            mins = (datetime.now(HKT) - S["started_at"]).total_seconds() / 60.0
+            elapsed = f" · 已監察 {mins:.0f} 分鐘"
+        st.markdown(
+            f'<div style="font-family:JetBrains Mono,monospace;font-size:11px;color:var(--subtext);'
+            f'margin-bottom:8px">時間軸：開機後經過時間（左＝開機，右＝現在）{elapsed} · '
+            f'如需對齊開跑倒數，可在上方填開跑時間</div>',
+            unsafe_allow_html=True)
+
+    # ── sliding-window / multi-race tracking indicator ──
+    win_label = "、".join(f"R{n}" for n in window)
+    tracked = [k for k, s in st.session_state.RACES.items() if len(s["series"]) > 0]
+    parts_list = []
+    for k in tracked:
+        parts = k.split("|")
+        try:
+            rno = int(parts[2])
+        except Exception:
+            continue
+        label = f"R{rno}"
+        if k == race_key:
+            label = f"<b style='color:var(--text)'>{label}</b>"
+        parts_list.append((rno, label))
+    parts_list.sort(key=lambda t: t[0])
+    tracked_str = "、".join(lbl for _, lbl in parts_list) if parts_list else "—"
+    st.markdown(
+        f'<div style="font-family:JetBrains Mono,monospace;font-size:10px;color:var(--muted);'
+        f'margin-bottom:8px">背景視窗（現正記錄）：{win_label} · '
+        f'已累積數據場次：{tracked_str} · 切換場次唔會清走數據</div>',
+        unsafe_allow_html=True)
+
+    # ── plunge alerts (recent fast drops) ──
+    alerts = []
+    win_df_full = df[df["池"] == "WIN"]
+    for _, r in win_df_full.iterrows():
+        key = (r["池"], r["馬號"])
+        pct, mag = recent_speed(S, key, PLUNGE_WINDOW)
+        if pct >= PLUNGE_PCT:
+            alerts.append((r["馬號"], pct, r["即場"]))
+    alerts.sort(key=lambda t: t[1], reverse=True)
+    for no, pct, odds in alerts[:3]:
+        st.markdown(
+            f'<div class="alert-bar">⚠️ '
+            f'<b>插水警示</b>　{no} 號於 {PLUNGE_WINDOW} 秒內急跌 {pct:.0f}%，即場 {odds:.1f}</div>',
+            unsafe_allow_html=True)
+
+    # ═══ #9 賽事資料 header（跟馬會格式）═══
+    _rinfo_key = f"rinfo_{race_date}_{course}_{race_no}"
+    _rinfo_ts_key = _rinfo_key + "_ts"
+    _rinfo_age = (_tnow - st.session_state.get(_rinfo_ts_key, _tnow - timedelta(days=1))).total_seconds()
+    if _rinfo_key not in st.session_state or _rinfo_age >= 300:
+        try:
+            st.session_state[_rinfo_key] = fetch_race_info(str(race_date), course, int(race_no))
+        except Exception:
+            st.session_state[_rinfo_key] = None
+        st.session_state[_rinfo_ts_key] = _tnow
+    _ri = st.session_state.get(_rinfo_key)
+    if _ri and _ri.get("no"):
+        _pt = ""
+        if _ri.get("post"):
+            try:
+                _pdt = datetime.fromisoformat(_ri["post"].replace("Z", "+00:00")).astimezone(HKT)
+                _pt = _pdt.strftime("%H:%M")
+            except Exception:
+                _pt = ""
+        _bits = [b for b in [
+            _pt, _ri.get("cls"), f'{_ri.get("dist")}米' if _ri.get("dist") else None,
+            _ri.get("track"), _ri.get("course"),
+            f'場地{_ri.get("going")}' if _ri.get("going") else None,
+            f'{_ri.get("field")}匹' if _ri.get("field") else None,
+        ] if b]
+        _rname = _ri.get("name") or ""
+        _name_html = (f'<div style="font-size:11px;color:var(--muted);margin-top:2px">{_rname}</div>'
+                      if _rname else "")
+        st.markdown(
+            f'<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;'
+            f'padding:8px 14px;margin-bottom:10px">'
+            f'<span style="font-size:13px;font-weight:600;color:var(--text)">'
+            f'{_ri.get("date","")} {venue_label(_ri.get("venue",""))} · 第 {_ri["no"]} 場</span>'
+            f'<span style="font-size:11px;color:var(--subtext);margin-left:10px">'
+            f'{" · ".join(_bits)}</span>'
+            f'{_name_html}'
+            f'</div>', unsafe_allow_html=True)
+
+    # ═══ MODEL 即時計算：基本面 + HKJC 即時獨贏賠率 ═══
+    st.markdown(
+        '<div class="panel-title" style="margin-top:4px">🧠 V19 即時量化模型</div>'
+        '<div class="panel-sub">Benter 第二階：歷史基本面勝率 × 馬會即時獨贏市場概率；每 5 秒隨賠率更新</div>',
+        unsafe_allow_html=True)
+    _rebate_label = st.radio(
+        "EV 回扣設定", ["散戶／無回扣", "獨贏合資格回扣 10%"],
+        horizontal=True, key="model_rebate_mode",
+        help="10% 回扣只適用於符合馬會門檻的輸注；一般小額投注請選無回扣。")
+    _rebate_rate = 0.10 if "10%" in _rebate_label else 0.0
+    _live_win_odds = {
+        str(r["馬號"]): float(r["即場"])
+        for _, r in df[df["池"] == "WIN"].iterrows()
+        if _to_float(r.get("即場")) > 0
+    }
+    _model_rows = (_ri or {}).get("card_rows") or []
+    _model_df, _model_err = score_live_model(_model_rows, _live_win_odds, _rebate_rate)
+    if not _model_df.empty:
+        _shown = _model_df[["horse_key", "horse_name", "win_odds", "p_model",
+                            "p_public", "p_final", "overlay_pct", "fair_odds",
+                            "ev", "value", "p_place"]].copy()
+        _shown.columns = ["馬號", "馬名", "即時賠率", "基本面勝率", "市場勝率",
+                          "綜合勝率", "直博率", "Fair Odds", "EV", "預期回報", "位置概率"]
+        _shown["馬號"] = _shown["馬號"].astype(str)
+        for _c in ("基本面勝率", "市場勝率", "綜合勝率", "位置概率"):
+            _shown[_c] = _shown[_c].map(lambda x: f"{x:.2%}")
+        _shown["直博率"] = _shown["直博率"].map(lambda x: f"{x:+.1f}%")
+        _shown["Fair Odds"] = _shown["Fair Odds"].map(lambda x: f"{x:.2f}")
+        _shown["即時賠率"] = _shown["即時賠率"].map(lambda x: f"{x:.1f}")
+        _shown["EV"] = _shown["EV"].map(lambda x: f"{x:.3f}")
+        _shown["預期回報"] = _shown["預期回報"].map(lambda x: f"{x:+.1%}")
+        st.dataframe(_shown, hide_index=True, use_container_width=True)
+        _value_count = int((_model_df["ev"] > 1.0).sum())
+        st.caption(
+            f"即時辨識 {_value_count} 匹 EV > 1；直博率 = 綜合勝率 ÷ 市場勝率 − 1。"
+            "綜合勝率及位置概率為模型估算，並非保證結果。")
+    else:
+        st.info(f"模型等待資料：{_model_err or '排位或獨贏賠率尚未齊全'}")
+
+    # ═══ ① 四彩池投注額 ═══
+    if win_inv or pla_inv or this_inv.get("QIN") or this_inv.get("QPL"):
+        def _tcard(label, val, accent):
+            return (f'<div style="flex:1;background:var(--card);border:1px solid var(--border);'
+                    f'border-radius:10px;padding:8px 12px;position:relative;overflow:hidden">'
+                    f'<div style="position:absolute;top:0;left:0;right:0;height:2px;background:{accent}"></div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;font-size:10px;color:var(--subtext);'
+                    f'letter-spacing:0.06em">{label}</div>'
+                    f'<div style="font-size:18px;font-weight:600;color:var(--text);margin-top:2px">'
+                    f'{_fmt_money(val)}</div></div>')
+        st.markdown(
+            f'<div style="display:flex;gap:8px;margin-bottom:10px">'
+            f'{_tcard("獨贏 WIN", win_inv, INFO)}'
+            f'{_tcard("位置 PLA", pla_inv, "#3b82f6")}'
+            f'{_tcard("連贏 QIN", this_inv.get("QIN"), "#e0a83c")}'
+            f'{_tcard("位置Q QPL", this_inv.get("QPL"), "#b48c3c")}'
+            f'</div>',
+            unsafe_allow_html=True)
+
+    # ═══ ② 連贏 / 位置Q 賠率矩陣 ═══
+    race_horses = sorted(int(x) for x in df[df["池"] == "WIN"]["馬號"].tolist())
+    if qin_matrix or qpl_matrix:
+        qcol1, qcol2 = st.columns(2)
+        with qcol1:
+            combo_matrix_panel(qin_matrix, "連贏 QIN", race_horses)
+        with qcol2:
+            combo_matrix_panel(qpl_matrix, "位置Q QPL", race_horses)
+
+    # PLA per-horse participation (share% within place pool)
+    _pla = df[df["池"] == "PLA"].copy()
     if not _pla.empty:
         _inv = 1.0 / _pla["即場"]
         pla_part = {int(h): v for h, v in zip(_pla["馬號"], _inv / _inv.sum() * 100.0)}
@@ -28,6 +2970,10 @@
             signal_summary_panel(_sig_events, minutes=30, as_of_ts=ACTIVE_NOW_TS)
 
     # ═══ ④ 投注額棒型圖（直向）═══
+    if use_disk and not replay_mode and LATEST_MINUTE_TS is not None:
+        _sample_time = datetime.fromtimestamp(LATEST_MINUTE_TS, HKT).strftime("%H:%M:%S")
+        _sample_age = max(0, int(datetime.now(HKT).timestamp() - LATEST_MINUTE_TS))
+        st.caption(f"最新1分依據 Recorder {_sample_time} 嘅快照（約 {_sample_age} 秒前）")
     _m1 = st.session_state.get("money_t1", MONEY_TIER1)
     _m2 = st.session_state.get("money_t2", MONEY_TIER2)
     _m3 = st.session_state.get("money_t3", MONEY_TIER3)
@@ -94,18 +3040,18 @@
     bcol1, bcol2 = st.columns(2)
     with bcol1:
         stake_bar_chart_v(df[df["池"] == "WIN"], "獨贏", win_inv, S,
-                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp, as_of_ts=ACTIVE_NOW_TS)
+                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp, as_of_ts=LATEST_MINUTE_TS)
     with bcol2:
         stake_bar_chart_v(df[df["池"] == "PLA"], "位置", pla_inv, S,
-                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp, as_of_ts=ACTIVE_NOW_TS)
+                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp, as_of_ts=LATEST_MINUTE_TS)
 
     # ═══ ⑤ 落注金額表（獨贏 / 位置）═══
     # 統一用 ACTIVE 變數：睇邊場（ACTIVE_RACE_KEY）、睇邊一刻（ACTIVE_NOW_TS）。
     # LIVE 同 REPLAY 行同一條 code，唔再分開兩套。
     minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", m1=_m1, m2=_m2, m3=_m3,
-                       disk_race_key=ACTIVE_RACE_KEY, as_of_ts=ACTIVE_NOW_TS)
+                       disk_race_key=ACTIVE_RACE_KEY, as_of_ts=LATEST_MINUTE_TS)
     minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="PLA", m1=_m1, m2=_m2, m3=_m3,
-                       disk_race_key=ACTIVE_RACE_KEY, as_of_ts=ACTIVE_NOW_TS)
+                       disk_race_key=ACTIVE_RACE_KEY, as_of_ts=LATEST_MINUTE_TS)
 
     # ── footer ──
     now_str = datetime.now(HKT).strftime("%H:%M:%S")
