@@ -151,7 +151,8 @@ st.markdown("<div style='padding:8px 12px;margin-bottom:8px;border:1px solid #3b
 #  DISK STORAGE (永久儲存 — 寫落硬碟，重啟唔失)
 # ════════════════════════════════════════════════════════════
 # 每場一個資料夾，每個時間點一個 JSON snapshot（每 30 秒一次）。
-DATA_DIR = os.environ.get("HKJC_DATA_DIR", os.path.join(os.path.expanduser("~"), "hkjc_data_v19"))
+DATA_DIR = os.environ.get("HKJC_DATA_DIR", os.path.join(os.path.expanduser("~"), "hkjc_data"))
+APP_DATA_DIR = os.environ.get("HKJC_V19_DATA_DIR", os.path.join(os.path.expanduser("~"), "hkjc_data_v19"))
 SNAPSHOT_INTERVAL = 30  # 秒，每隔幾耐存一個 snapshot
 
 def _race_dir(race_key):
@@ -162,7 +163,7 @@ def _race_dir(race_key):
 def save_snapshot(race_key, snapshot):
     """Write one timepoint snapshot to disk as JSON. snapshot is a dict."""
     try:
-        rd = _race_dir(race_key)
+        rd = os.path.join(APP_DATA_DIR, race_key.replace("|", "__"))
         os.makedirs(rd, exist_ok=True)
         ts = snapshot.get("ts", datetime.now().timestamp())
         fn = os.path.join(rd, f"{int(ts)}.json")
@@ -253,7 +254,7 @@ def post_time_for_race(race_key):
     return val
 
 def _settings_path():
-    return os.path.join(DATA_DIR, "_settings.json")
+    return os.path.join(APP_DATA_DIR, "_settings.json")
 
 def load_settings():
     """讀返上次「儲存設定」寫低嘅敏感度數值。有問題就返回空dict（用返程式預設值）。"""
@@ -266,7 +267,7 @@ def load_settings():
 def save_settings(settings):
     """將敏感度設定寫落硬碟，下次開app/restart都會自動讀返，唔使成日調。"""
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
         with open(_settings_path(), "w", encoding="utf-8") as f:
             json.dump(settings, f, ensure_ascii=False)
         return True
@@ -1188,6 +1189,20 @@ def stake_in_bucket(S, pool_name, horse, ts_start, ts_end):
         return None
     return s_end - s_start
 
+def latest_minute_gain(S, pool_name, horse, end_ts):
+    """Use real samples spanning the latest minute; missing baseline stays blank."""
+    hist = S["stake_hist"][(pool_name, str(horse))]
+    cutoff = end_ts - 60
+    before = [(ts, value) for ts, value in hist if ts <= cutoff]
+    at_end = [(ts, value) for ts, value in hist if ts <= end_ts]
+    if not before or not at_end:
+        return None
+    start_ts, start_value = before[-1]
+    end_sample_ts, end_value = at_end[-1]
+    if cutoff - start_ts > 45 or end_sample_ts <= cutoff:
+        return None
+    return end_value - start_value
+
 def current_stake(S, pool_name, horse):
     """該馬即場累積總投注額（佔比法，= 棒型圖棒高 = 每分鐘表合計）。"""
     hist = S["stake_hist"][(pool_name, str(horse))]
@@ -1856,7 +1871,7 @@ def stake_bar_chart_v(df_pool, pool_name, pool_inv, S, sort_by="馬號",
         odds = r["即場"]
         stake = r["投注額"]
         # 棒色：最近一個完整分鐘流入（同每分鐘表同步）
-        inflow = stake_in_bucket(S, pool_code, horse, m_start, m_end) if S is not None else None
+        inflow = latest_minute_gain(S, pool_code, horse, m_end) if S is not None else None
         inflow = inflow or 0.0
         if inflow >= m3:
             bcol = "#c878ff"
@@ -1942,6 +1957,10 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
         is_hour = start_e >= 60   # 60呢格仲係大格,唔變色；30/20/10之後嘅逐分鐘格先變色
         cols.append((lbl, is_hour, False, edge_ts(start_e), edge_ts(end_e)))
 
+    latest_end_ts = (as_of_ts if as_of_ts is not None
+                     else datetime.now(HKT).timestamp())
+    cols.append(("最新1分", False, True, latest_end_ts - 60, latest_end_ts))
+
     def stake_bucket(horse, ts_start, ts_end):
         if ts_end is None:
             return None
@@ -1953,6 +1972,8 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
             if s_end is None or s_start is None:
                 return None
             return s_end - s_start
+        if ts_end == latest_end_ts and ts_start == latest_end_ts - 60:
+            return latest_minute_gain(S, pool, horse, latest_end_ts)
         return stake_in_bucket(S, pool, horse, ts_start, ts_end)
 
     # 「隔夜」「當日」由硬碟計（唔受記憶體deque上限影響，開賣提前幾耐都啱）；
@@ -1988,7 +2009,8 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
     head = '<th style="text-align:left;padding:3px 5px;font-size:9px;color:var(--muted);position:sticky;left:0;background:var(--card)">馬 賠</th>'
     for (lbl, is_hour, is_prev, _, _) in cols:
         col_bg = "background:rgba(30,30,44,0.5);" if is_hour else ""
-        head += (f'<th style="text-align:right;padding:2px 5px;font-size:9px;color:{"#78899a" if is_hour else "var(--muted)"};{col_bg}">'
+        sync_head = 'border-left:2px solid rgba(80,170,255,0.55);' if is_prev else ''
+        head += (f'<th style="text-align:right;padding:2px 5px;font-size:9px;color:{"#78899a" if is_hour else "var(--muted)"};{col_bg}{sync_head}">'
                  f'{lbl}</th>')
     head += '<th style="text-align:right;padding:3px 5px;font-size:9px;color:#e0a83c">合計</th>'
 
@@ -1997,7 +2019,7 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
         # 合計 = 即場總投注（佔比法，同棒型圖棒高一致）
         total = current_stake(S, pool, horse)
         if total is None:
-            total = sum(v for v in per_col if v) or 0
+            total = sum(v for v in per_col[:-1] if v) or 0
         cells = ""
         for (lbl, is_hour, is_prev, _, _), v in zip(cols, per_col):
             txt = f'+{_fmt_money(v)}' if (v and v > 0) else ('—' if not v else _fmt_money(v))
@@ -2006,7 +2028,8 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
                 if v >= m3: bg = 'background:rgba(200,120,255,0.15);'
                 elif v >= m2: bg = 'background:rgba(255,140,60,0.15);'
                 elif v >= m1: bg = 'background:rgba(255,212,59,0.12);'
-            cells += f'<td style="text-align:right;padding:2px 5px;font-size:10px;color:{cellcol(v,is_hour)};{bg}font-family:JetBrains Mono,monospace">{txt}</td>'
+            sync_border = 'border-left:2px solid rgba(80,170,255,0.55);' if is_prev else ''
+            cells += f'<td style="text-align:right;padding:2px 5px;font-size:10px;color:{cellcol(v,is_hour)};{bg}{sync_border}font-family:JetBrains Mono,monospace">{txt}</td>'
         body += (f'<tr><td style="padding:3px 5px;font-size:11px;color:var(--text);white-space:nowrap;position:sticky;left:0;background:var(--card)">'
                  f'{horse} <span style="font-size:8px;color:var(--subtext)">{odds:g}</span></td>'
                  f'{cells}'
@@ -2016,7 +2039,7 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
         f'<div class="panel" style="overflow-x:auto">'
         f'<div class="panel-title">📋 落注金額表（{title} · 時間由左到右）</div>'
         f'<div class="panel-sub">隔夜(開賣→00:00) · 當日(00:00→-60分,全場一致) · '
-        f'60/30/20/10(每段) · 10分之後逐分鐘 → 開跑 · '
+        f'60/30/20/10(每段) · 10分之後逐分鐘 → 開跑 · 最新1分＝畫面時間向前60秒 · '
         f'⚡{_fmt_money(m1)}黃/🔥{_fmt_money(m2)}橙/💥{_fmt_money(m3)}紫（只臨場逐分鐘格變色）· 合計＝總投注（同棒型圖）</div>'
         f'<table style="border-collapse:collapse;width:100%">'
         f'<tr>{head}</tr>{body}</table>'
@@ -2473,6 +2496,10 @@ else:
         S = reset_state(LIVE_RACE_KEY)
     else:
         S = get_state(LIVE_RACE_KEY)
+    _source_key = f"_last_use_disk_{LIVE_RACE_KEY}"
+    if use_disk and st.session_state.get(_source_key) is False:
+        S = reset_state(LIVE_RACE_KEY)
+    st.session_state[_source_key] = use_disk
     ACTIVE_POST_TIME = None      # 下面由 manual_post / 硬碟 snapshot 決定
     ACTIVE_NOW_TS = None         # None ＝ 用「而家」
 
@@ -2579,7 +2606,7 @@ else:
         st.error(f"⚠️ 連線失敗：{e}")
         pools = []
 
-# Pool turnover (彩池金額) — cached, refreshed at most every 20s so it never
+# Pool turnover (彩池金額) — cached, refreshed at most every 10s so it never
 # slows the 5s odds cycle. If it fails, money flow falls back to percentage.
 if "turnover_cache" not in st.session_state:
     st.session_state.turnover_cache = {}
@@ -2589,7 +2616,7 @@ _tkey = f"{race_date}|{course}"
 _tnow = datetime.now(HKT)
 _need = (st.session_state.turnover_cache_key != _tkey
          or st.session_state.turnover_cache_ts is None
-         or (_tnow - st.session_state.turnover_cache_ts).total_seconds() >= 20)
+         or (_tnow - st.session_state.turnover_cache_ts).total_seconds() >= 10)
 if _need and not use_disk:
     try:
         st.session_state.turnover_cache = fetch_turnover(str(race_date), course)
@@ -2640,9 +2667,11 @@ ACTIVE_POST_TIME = S["post_time"]
 df = pools_to_df(pools)
 
 # ── 讀硬碟 LIVE：用最新 snapshot 重建（唔拉 HKJC，快、自動開跑時間）──
+LATEST_MINUTE_TS = ACTIVE_NOW_TS
 if use_disk and not replay_mode:
     _snap = load_latest_snapshot(race_key)
     if _snap:
+        LATEST_MINUTE_TS = _snap.get("ts")
         rows_d = []
         for h, o in (_snap.get("win") or {}).items():
             rows_d.append({"池": "WIN", "馬號": h, "賠率": float(o), "大熱": False})
@@ -2712,16 +2741,17 @@ else:
         else:
             mtp = None
     else:
-        df, mtp = enrich(df, S)
+        df, mtp = enrich(df, S, record=not use_disk)
         # Record current stake ($) per horse for surge detection (only when pool known)
-        record_stakes(df[df["池"] == "WIN"], "WIN", win_inv, S)
-        record_stakes(df[df["池"] == "PLA"], "PLA", pla_inv, S)
+        if not use_disk:
+            record_stakes(df[df["池"] == "WIN"], "WIN", win_inv, S)
+            record_stakes(df[df["池"] == "PLA"], "PLA", pla_inv, S)
 
         # ── 寫硬碟 snapshot（每 30 秒一次）──
         _snap_key = f"_last_snap_{race_key}"
         _now_epoch = datetime.now(HKT).timestamp()
         _last_snap = st.session_state.get(_snap_key, 0)
-        if _now_epoch - _last_snap >= SNAPSHOT_INTERVAL:
+        if not use_disk and _now_epoch - _last_snap >= SNAPSHOT_INTERVAL:
             try:
                 snap = {
                     "ts": _now_epoch,
@@ -2804,12 +2834,13 @@ else:
             unsafe_allow_html=True)
 
     # ═══ #9 賽事資料 header（跟馬會格式）═══
-    _rinfo_key = f"rinfo_{race_date}_{course}_{race_no}"
+    _info_date, _info_venue, _info_race = ACTIVE_RACE_KEY.split("|", 2)
+    _rinfo_key = f"rinfo_{_info_date}_{_info_venue}_{_info_race}"
     _rinfo_ts_key = _rinfo_key + "_ts"
     _rinfo_age = (_tnow - st.session_state.get(_rinfo_ts_key, _tnow - timedelta(days=1))).total_seconds()
     if _rinfo_key not in st.session_state or _rinfo_age >= 300:
         try:
-            st.session_state[_rinfo_key] = fetch_race_info(str(race_date), course, int(race_no))
+            st.session_state[_rinfo_key] = fetch_race_info(_info_date, _info_venue, int(_info_race))
         except Exception:
             st.session_state[_rinfo_key] = None
         st.session_state[_rinfo_ts_key] = _tnow
@@ -2940,6 +2971,10 @@ else:
             signal_summary_panel(_sig_events, minutes=30, as_of_ts=ACTIVE_NOW_TS)
 
     # ═══ ④ 投注額棒型圖（直向）═══
+    if use_disk and not replay_mode and LATEST_MINUTE_TS is not None:
+        _sample_time = datetime.fromtimestamp(LATEST_MINUTE_TS, HKT).strftime("%H:%M:%S")
+        _sample_age = max(0, int(datetime.now(HKT).timestamp() - LATEST_MINUTE_TS))
+        st.caption(f"最新1分依據 Recorder {_sample_time} 嘅快照（約 {_sample_age} 秒前）")
     _m1 = st.session_state.get("money_t1", MONEY_TIER1)
     _m2 = st.session_state.get("money_t2", MONEY_TIER2)
     _m3 = st.session_state.get("money_t3", MONEY_TIER3)
@@ -3006,18 +3041,18 @@ else:
     bcol1, bcol2 = st.columns(2)
     with bcol1:
         stake_bar_chart_v(df[df["池"] == "WIN"], "獨贏", win_inv, S,
-                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp, as_of_ts=ACTIVE_NOW_TS)
+                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp, as_of_ts=LATEST_MINUTE_TS)
     with bcol2:
         stake_bar_chart_v(df[df["池"] == "PLA"], "位置", pla_inv, S,
-                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp, as_of_ts=ACTIVE_NOW_TS)
+                          sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp, as_of_ts=LATEST_MINUTE_TS)
 
     # ═══ ⑤ 落注金額表（獨贏 / 位置）═══
     # 統一用 ACTIVE 變數：睇邊場（ACTIVE_RACE_KEY）、睇邊一刻（ACTIVE_NOW_TS）。
     # LIVE 同 REPLAY 行同一條 code，唔再分開兩套。
     minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", m1=_m1, m2=_m2, m3=_m3,
-                       disk_race_key=ACTIVE_RACE_KEY, as_of_ts=ACTIVE_NOW_TS)
+                       disk_race_key=ACTIVE_RACE_KEY, as_of_ts=LATEST_MINUTE_TS)
     minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="PLA", m1=_m1, m2=_m2, m3=_m3,
-                       disk_race_key=ACTIVE_RACE_KEY, as_of_ts=ACTIVE_NOW_TS)
+                       disk_race_key=ACTIVE_RACE_KEY, as_of_ts=LATEST_MINUTE_TS)
 
     # ── footer ──
     now_str = datetime.now(HKT).strftime("%H:%M:%S")
