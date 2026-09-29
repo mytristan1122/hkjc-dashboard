@@ -3,6 +3,8 @@ import math
 import tempfile
 import fcntl
 import hashlib
+import io
+import re
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -20,6 +22,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 
 import requests
+import pandas as pd
 
 API = "https://info.cld.hkjc.com/graphql/base/"
 
@@ -34,6 +37,80 @@ HEADERS = {
 HKT = timezone(timedelta(hours=8))
 
 DATA_DIR = os.environ.get("HKJC_DATA_DIR", os.path.join(os.path.expanduser("~"), "hkjc_data"))
+
+RESULTS_URL = "https://racing.hkjc.com/en-us/local/information/archive/localresults"
+STYLE_LABELS = ("放頭", "前置", "中置", "後上")
+
+
+def classify_running_style(value, field_size):
+    positions = [int(x) for x in re.findall(r"\d+", str(value or "")) if int(x) > 0]
+    try:
+        field = max(1, int(field_size or max(positions or [1])))
+    except (TypeError, ValueError):
+        field = max(1, max(positions or [1]))
+    if not positions:
+        return "未知"
+    early = positions[0]
+    lead_cut = max(1, math.ceil(field * 0.25))
+    front_cut = max(2, math.ceil(field * 0.50))
+    back_cut = max(front_cut + 1, math.ceil(field * 0.75))
+    if early <= lead_cut:
+        return "放頭"
+    if early <= front_cut:
+        return "前置"
+    if early >= back_cut:
+        return "後上"
+    return "中置"
+
+
+def build_postrace_analysis(race_key, race_meta, runs, previous=None):
+    previous = previous or {}
+    field = max(1, int(race_meta.get("field_size") or len(runs) or 1))
+    enriched = []
+    for row in runs:
+        item = dict(row)
+        item["horse_no"] = int(item.get("horse_no") or 0)
+        item["field_size"] = field
+        item["running_style"] = classify_running_style(item.get("running_position"), field)
+        try:
+            item["finishing_position"] = int(item["finishing_position"])
+        except (TypeError, ValueError, KeyError):
+            item["finishing_position"] = None
+        enriched.append(item)
+    style_history = {str(k): list(v) for k, v in (previous.get("style_history") or {}).items()}
+    for item in enriched:
+        style = item["running_style"]
+        if style in STYLE_LABELS:
+            key = str(item.get("horse_id") or item["horse_no"])
+            style_history.setdefault(key, []).append(style)
+            style_history[key] = style_history[key][-12:]
+    style_stats, draw_stats = {}, {}
+    for item in enriched:
+        pos = item.get("finishing_position")
+        if pos is None:
+            continue
+        style = item["running_style"]
+        stat = style_stats.setdefault(style, {"n": 0, "top3": 0})
+        stat["n"] += 1
+        stat["top3"] += int(pos <= 3)
+        draw = item.get("draw")
+        if draw:
+            stat = draw_stats.setdefault(str(draw), {"n": 0, "top3": 0})
+            stat["n"] += 1
+            stat["top3"] += int(pos <= 3)
+    baseline = min(3.0 / field, 1.0)
+    for stats in (style_stats, draw_stats):
+        for stat in stats.values():
+            rate = stat["top3"] / stat["n"] if stat["n"] else 0.0
+            stat.update(top3_rate=rate, lift=rate / baseline if baseline else 1.0,
+                        reliable=stat["n"] >= 4)
+    reliable = {k: v for k, v in style_stats.items() if v["reliable"]}
+    bias = ("利" + max(reliable, key=lambda k: reliable[k]["lift"])) if reliable else "樣本不足"
+    valid = [r for r in enriched if r.get("finishing_position") is not None]
+    return {"schema_version": 1, "race_key": race_key, "race_meta": race_meta,
+            "runs": enriched, "style_history": style_history,
+            "style_stats": style_stats, "draw_stats": draw_stats,
+            "bias_label": bias, "completed": bool(valid)}
 
 SCAN_SEC = 5  # Fixed requested cadence; legacy HKJC_SCAN_SEC=30 must not override it.
 
@@ -222,6 +299,79 @@ def atomic_json(path, value):
             os.unlink(temp)
 
 
+def _result_col(table, *names):
+    cols = {str(c).strip().lower().rstrip('.'): c for c in table.columns}
+    for name in names:
+        n = name.lower().rstrip('.')
+        for c, norm in cols.items():
+            if norm == n or norm.startswith(n):
+                return cols[c]
+    return None
+
+
+def _result_int(value):
+    m = re.search(r"\d+", str(value or ""))
+    return int(m.group()) if m else None
+
+
+def fetch_postrace_runs(date_str, venue, race_no):
+    """Fetch all runners and HKJC Running Position after a race finishes."""
+    params = {'racedate': str(date_str).replace('-', '/'), 'racecourse': venue,
+              'RaceNo': int(race_no)}
+    response = requests.get(RESULTS_URL, params=params, headers=HEADERS, timeout=25)
+    response.raise_for_status()
+    tables = pd.read_html(io.StringIO(response.text))
+    table = None
+    for candidate in tables:
+        cols = {str(c).strip().lower().rstrip('.') for c in candidate.columns}
+        if len({'pla', 'horse no', 'horse', 'jockey'} & cols) >= 3:
+            table = candidate.copy()
+            break
+    if table is None or table.empty:
+        raise RuntimeError('賽果頁未找到完整賽果表')
+    table_html = next((m.group(0) for m in re.finditer(r"<table\b.*?</table>", response.text, re.I | re.S)
+                       if "horse no" in m.group(0).lower() and "jockey" in m.group(0).lower()), "")
+    row_ids = []
+    if table_html:
+        for tr in re.findall(r"<tr\b.*?</tr>", table_html, re.I | re.S):
+            m = re.search(r"horseid=([A-Za-z0-9_]+)", tr, re.I)
+            if m:
+                row_ids.append(m.group(1))
+    c_no = _result_col(table, 'horse no')
+    c_pla = _result_col(table, 'pla')
+    c_horse = _result_col(table, 'horse')
+    c_run = _result_col(table, 'running position', 'running')
+    c_draw = _result_col(table, 'dr', 'draw')
+    runs = []
+    for i, (_, row) in enumerate(table.iterrows()):
+        no = _result_int(row.get(c_no))
+        if no is None:
+            continue
+        runs.append({'horse_no': no, 'horse_name': str(row.get(c_horse) or no),
+                     'horse_id': row_ids[i] if len(row_ids) == len(table) and i < len(row_ids) else None,
+                     'finishing_position': _result_int(row.get(c_pla)),
+                     'running_position': str(row.get(c_run) or ''),
+                     'draw': _result_int(row.get(c_draw))})
+    if not runs:
+        raise RuntimeError('賽果頁沒有參賽馬資料')
+    return runs
+
+
+def save_postrace_analysis(race_key, meeting, race_no, previous=None):
+    date_str = str(meeting.get('date') or '')[:10]
+    venue = meeting.get('venueCode') or race_key.split('|')[1]
+    runs = fetch_postrace_runs(date_str, venue, race_no)
+    race = next((r for r in meeting.get('races') or [] if int(r.get('no')) == int(race_no)), {})
+    meta = {'date': date_str, 'venue': venue, 'race_no': int(race_no),
+            'field_size': int(race.get('wageringFieldSize') or len(runs)),
+            'distance': race.get('distance'), 'going': race.get('go_ch'),
+            'track': (race.get('raceTrack') or {}).get('description_ch'),
+            'course': (race.get('raceCourse') or {}).get('displayCode')}
+    result = build_postrace_analysis(race_key, meta, runs, previous=previous)
+    atomic_json(Path(DATA_DIR) / race_key.replace('|', '__') / 'postrace.json', result)
+    return result
+
+
 def atomic_snapshot(race_key, snapshot):
     directory = Path(DATA_DIR) / race_key.replace('|', '__')
     stored = dict(snapshot)
@@ -258,7 +408,7 @@ def record_one(meeting, race_no, meeting_ts):
     return True
 
 
-def record_meeting(meeting, executor, closing_done):
+def record_meeting(meeting, executor, closing_done, results_done, results_last_try):
     meeting_ts = datetime.now(HKT).timestamp()
     selling, metadata = {}, {}
     for rc in meeting.get('races') or []:
@@ -274,7 +424,9 @@ def record_meeting(meeting, executor, closing_done):
         # Capture a final sample after betting closes, without polling it forever.
         if not is_selling and key not in closing_done:
             continue
-        if not is_selling and closing_done[key]:
+        if not is_selling and closing_done.get(key) and not results_done.get(key):
+            continue
+        if not is_selling and closing_done.get(key) and results_done.get(key):
             continue
         jobs.append((no, key, is_selling, executor.submit(record_one, meeting, no, meeting_ts)))
     recorded = 0
@@ -283,8 +435,39 @@ def record_meeting(meeting, executor, closing_done):
             if future.result():
                 recorded += 1
                 closing_done[key] = not selling_now
+                # Once betting has closed, keep retrying the official result
+                # page at most once per minute until all runners are available.
+                if not selling_now and not results_done.get(key):
+                    now = time.time()
+                    if now - results_last_try.get(key, 0.0) >= 60:
+                        results_last_try[key] = now
+                        try:
+                            previous = None
+                            result = save_postrace_analysis(key, meeting, no, previous=previous)
+                            if result.get('completed'):
+                                results_done[key] = True
+                                log(f'{key} 賽後跑法／場地偏差已保存（{len(result.get("runs") or [])}匹）')
+                        except Exception as result_exc:
+                            log(f'{key} 賽後分析稍後重試：{result_exc}')
         except Exception as exc:
             log(f'{key} 記錄失敗：{exc}')
+    # Retry result pages independently of the final betting snapshot.
+    now = time.time()
+    for rc in meeting.get('races') or []:
+        no = int(rc.get('no'))
+        key = f"{str(meeting['date'])[:10]}|{meeting['venueCode']}|{no}"
+        if not closing_done.get(key) or results_done.get(key):
+            continue
+        if now - results_last_try.get(key, 0.0) < 60:
+            continue
+        results_last_try[key] = now
+        try:
+            result = save_postrace_analysis(key, meeting, no)
+            if result.get('completed'):
+                results_done[key] = True
+                log(f'{key} 賽後跑法／場地偏差已保存（{len(result.get("runs") or [])}匹）')
+        except Exception as exc:
+            log(f'{key} 賽後分析稍後重試：{exc}')
     return recorded
 
 
@@ -298,6 +481,8 @@ def main():
     except BlockingIOError:
         raise SystemExit('另一個新版 Recorder 已在運行；停止重複啟動。')
     closing_done = {}
+    results_done = {}
+    results_last_try = {}
     active = []
     last_discovery = 0.0
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -318,7 +503,7 @@ def main():
                     if meeting is None:
                         log(f'{date_str} {venue}：API無相符日期／馬場，略過')
                         continue
-                    count += record_meeting(meeting, executor, closing_done)
+                    count += record_meeting(meeting, executor, closing_done, results_done, results_last_try)
                 elapsed = time.monotonic() - started
                 log(f'寫入{count}場；本輪{elapsed:.2f}秒；目標{SCAN_SEC}秒' + ('（本輪超時）' if elapsed > SCAN_SEC else ''))
             except Exception:
