@@ -85,7 +85,7 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V19-R2.2-PACEBIAS-20260929"
+APP_VERSION = "V19-R2.2.1-REPLAY-FIX-20260929"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -1870,7 +1870,7 @@ qpl_matrix = {tuple(map(int, k.split(','))): v for k, v in (snap.get('qpl') or {
 _ri = snap.get('race_info')
 if not race_info_matches(_ri, race_key):
     _ri = None
-_day_analysis = load_day_postrace(race_date.isoformat(), venue, int(race_no))
+_day_analysis = load_day_postrace(race_date.isoformat(), course, int(race_no))
 _current_postrace = load_postrace_analysis(race_key)
 _declared_rows = (_ri or {}).get('card_rows') or []
 _history_styles = historical_style_history(_declared_rows, race_date.isoformat(), _day_analysis)
