@@ -170,12 +170,26 @@ def main():
     ap.add_argument("--output",type=Path,default=DEFAULT_OUTPUT)
     ap.add_argument("--start-date",help="YYYY-MM-DD (optional)")
     ap.add_argument("--end-date",help="YYYY-MM-DD (optional)")
+    ap.add_argument("--extra-meeting",action="append",default=[],metavar="DATE:VENUE",
+                    help="Add a meeting absent from the model index, e.g. 2026-09-16:HV; repeat as needed")
     ap.add_argument("--max-meetings",type=int,default=0,help="0 means all matching meetings")
     ap.add_argument("--sleep",type=float,default=1.5,help="seconds between meeting pages")
     args=ap.parse_args()
     if not args.index_csv.exists():
         sys.exit(f"Model history CSV not found: {args.index_csv}. Upload the V19.1 hkjc_quant/data/runs_clean.csv first.")
-    meetings=load_index(args.index_csv); dates=sorted(meetings)
+    meetings=load_index(args.index_csv)
+    for spec in args.extra_meeting:
+        try:
+            date,venue=spec.split(":",1)
+            datetime.strptime(date,"%Y-%m-%d")
+            venue=venue.strip().upper()
+            if venue not in {"ST","HV"}: raise ValueError("venue must be ST or HV")
+            if date in meetings and meetings[date]["venues"] != {venue}:
+                raise ValueError(f"{date} already exists in index with a different venue")
+            meetings.setdefault(date,{"venues":set(),"races":{}})["venues"].add(venue)
+        except ValueError as e:
+            sys.exit(f"Invalid --extra-meeting {spec!r}: {e}")
+    dates=sorted(meetings)
     if args.start_date: dates=[d for d in dates if d>=args.start_date]
     if args.end_date: dates=[d for d in dates if d<=args.end_date]
     if args.max_meetings: dates=dates[:args.max_meetings]
