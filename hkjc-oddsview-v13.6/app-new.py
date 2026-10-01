@@ -85,7 +85,7 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V19-R2.3.2-THIN65-20261001"
+APP_VERSION = "V19-R2.3.3-ROWHL-20261001"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -315,6 +315,9 @@ html, body, .stApp { background:var(--bg)!important; color:var(--text); font-fam
 .stApp > div[data-stale="true"] { opacity:1!important; filter:none!important; }
 [data-stale="true"] { opacity:1!important; }
 .block-container { padding:0.8rem 1.6rem 2rem!important; max-width:100%!important; }
+/* 落注金額表：hover 某匹馬時成行打橫 highlight（方便對齊看時間格） */
+.staketbl tbody tr:hover td { background:rgba(80,170,255,0.16)!important; }
+.staketbl tbody tr:hover td:first-child { background:#1c2740!important; color:#dce8ff!important; }
 .hdr { display:flex; align-items:center; justify-content:space-between; padding:10px 16px;
   background:var(--surface); border:1px solid var(--border); border-radius:10px; margin-bottom:10px; }
 .hdr-title { font-size:16px; font-weight:600; color:var(--text); }
@@ -834,8 +837,8 @@ def minute_stake_table(df, S, win_inv, pla_inv, mtp, pool="WIN", n_min=9,
         f'<div class="panel-sub">\u9694\u591c(\u958b\u8ce3\u219200:00) \u00b7 \u7576\u65e5(00:00\u2192-60\u5206,\u5168\u5834\u4e00\u81f4) \u00b7 '
         f'60/30/20/10(\u6bcf\u6bb5) \u00b7 10\u5206\u4e4b\u5f8c\u9010\u5206\u9418 \u2192 \u958b\u8dd1 \u00b7 \u6700\u65b01\u5206\uff1d\u756b\u9762\u6642\u9593\u5411\u524d60\u79d2 \u00b7 '
         f'\u26a1{_fmt_money(m1)}\u9ec3/\U0001f525{_fmt_money(m2)}\u6a59/\U0001f4a5{_fmt_money(m3)}\u7d2b\uff08\u53ea\u81e8\u5834\u9010\u5206\u9418\u683c\u8b8a\u8272\uff09\u00b7 \u5408\u8a08\uff1d\u7e3d\u6295\u6ce8\uff08\u540c\u68d2\u578b\u5716\uff09</div>'
-        f'<table style="border-collapse:collapse;width:100%">'
-        f'<tr>{head}</tr>{body}</table>'
+        f'<table class="staketbl" style="border-collapse:collapse;width:100%">'
+        f'<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
         f'</div>'
     )
     st.markdown(html, unsafe_allow_html=True)
