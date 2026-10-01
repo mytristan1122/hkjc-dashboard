@@ -85,7 +85,7 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V19-R2.3.0-NOMODEL-20261001"
+APP_VERSION = "V19-R2.3.2-THIN65-20261001"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -1416,10 +1416,31 @@ def load_snapshots(race_key):
     except OSError as exc:
         st.session_state['_archive_error'] = str(exc)
         return []
+    # ── RAM 省（第二步）：最近 DENSE_SEC 秒密集保留（5 秒一格），更舊抽疏到每分鐘一格。
+    # 落注表 隔夜/當日/60/30/20/10 用「累積 sample_at」（無 max_age），抽疏唔影響準確度；
+    # 訊號偵測只跑最近 31 分鐘（< DENSE_SEC，仍在密集區），window_gain 正常；逐分鐘/插水
+    # 用最新一分鐘（密集）。只有深度 REPLAY 到幾個鐘前先會變每分鐘一格，落注表照準。
+    DENSE_SEC = 65 * 60
+    _valid_ts = sorted(int(p.stem) for p in paths if p.stem.isdigit())
+    keep_names = None
+    if _valid_ts:
+        _dense_from = _valid_ts[-1] - DENSE_SEC
+        _bucket = {}
+        keep_names = set()
+        for _ts in _valid_ts:
+            if _ts >= _dense_from:
+                keep_names.add(f"{_ts}.json")          # 最近 35 分鐘：全保留
+            else:
+                _bucket[_ts // 60] = _ts               # 更舊：每分鐘保留最後一格
+        for _ts in _bucket.values():
+            keep_names.add(f"{_ts}.json")
+        keep_names.add(f"{_valid_ts[0]}.json")         # 永遠保留最早一格（隔夜基準）
     for path in paths:
         if not path.stem.isdigit():
             continue
         name = path.name
+        if keep_names is not None and name not in keep_names:
+            continue                                    # 被抽疏：唔 parse、唔入 RAM
         seen.add(name)
         try:
             stat = path.stat()
@@ -1465,9 +1486,10 @@ def load_snapshots(race_key):
         except RuntimeError:
             pass
     st.session_state['_archive_error'] = '; '.join(errors[:3])
-    # Bound loaded races; selected race remains resident.
+    # Bound loaded races; only the selected race stays resident (RAM 省：3→1)。
+    # 每場 5 秒一格歷史 parse 入 RAM 約 300-400MB，保留 1 場而非 3 場，慳 ~500-800MB。
     for other in list(cache):
-        if len(cache) <= 3:
+        if len(cache) <= 1:
             break
         if other != race_key:
             del cache[other]
