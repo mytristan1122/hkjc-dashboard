@@ -85,7 +85,7 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V19-R2.2.3-RACE-FIX-20261001"
+APP_VERSION = "V19-R2.2.4-10SEC-20261001"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -1881,7 +1881,7 @@ else:
         snap = fetch_live_snapshot(race_key)
     except Exception as exc:
         st.error(f'\u5373\u6642\u8cc7\u6599\u66f4\u65b0\u5931\u6557\uff1a{exc}\u3002\u4eca\u6b21\u4e0d\u986f\u793a\u820a\u8cc7\u6599\u4f5c\u70ba\u6700\u65b0\u5831\u50f9\u3002')
-        st_autorefresh(interval=5000, key='live_refresh_v19_rebuilt')
+        st_autorefresh(interval=10000, key='live_refresh_v19_rebuilt')
         st.stop()
     buffer_key = '_live_buffer::' + race_key
     buffer = st.session_state.setdefault(buffer_key, [])
@@ -2063,4 +2063,4 @@ for code in ('WIN', 'PLA'):
 st.caption(f'{APP_NAME} {APP_VERSION} \u00b7 \u6b77\u53f2\u8cc7\u6599\u7531\u7368\u7acb Recorder \u8a18\u9304')
 
 if not replay_mode:
-    st_autorefresh(interval=5000, key="live_refresh_v19_rebuilt")
+    st_autorefresh(interval=10000, key="live_refresh_v19_rebuilt")
