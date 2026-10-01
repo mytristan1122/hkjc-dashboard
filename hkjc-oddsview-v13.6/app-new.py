@@ -85,7 +85,7 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V19-R2.2.4-10SEC-20261001"
+APP_VERSION = "V19-R2.3.0-NOMODEL-20261001"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -1062,161 +1062,9 @@ def signal_summary_panel(events, minutes=30, as_of_ts=None):
 
 APP_DIR = Path(__file__).resolve().parent
 MODEL_DIR = Path(os.environ.get("HKJC_MODEL_DIR", APP_DIR / "hkjc_quant"))
-MODEL_READY = False
-MODEL_IMPORT_ERROR = None
-try:
-    if str(MODEL_DIR) not in sys.path:
-        sys.path.insert(0, str(MODEL_DIR))
-    from features import build_features
-    from model import public_probabilities
-    from exotics import place_probs
-    MODEL_READY = True
-except Exception as _model_import_exc:
-    MODEL_IMPORT_ERROR = str(_model_import_exc)
-
-
-@st.cache_resource(show_spinner=False)
-def load_quant_assets():
-    """Load the portable model bundle and historical form once per process."""
-    if not MODEL_READY:
-        raise RuntimeError(MODEL_IMPORT_ERROR or "\u6a21\u578b\u6a21\u7d44\u672a\u80fd\u8f09\u5165")
-    model_path = MODEL_DIR / "models" / "latest_portable.json"
-    history_path = MODEL_DIR / "data" / "runs_clean.csv"
-    with model_path.open("r", encoding="utf-8") as fh:
-        bundle = json.load(fh)
-    history = pd.read_csv(history_path, parse_dates=["race_date"])
-    return bundle, history
-
-
-def _model_apply_scaler(df_features, scaler, feature_cols):
-    """Apply the exact training-time medians/means/stds and column order."""
-    base_cols = [c for c in feature_cols if not c.endswith("_isna")]
-    x = df_features[base_cols].copy()
-    flags = pd.DataFrame(index=x.index)
-    for flag_col in scaler.get("flag_cols", []):
-        source_col = flag_col[:-5] if flag_col.endswith("_isna") else flag_col
-        flags[flag_col] = x[source_col].isna().astype(int)
-    median = pd.Series(scaler["median"], dtype=float)
-    mean = pd.Series(scaler["mean"], dtype=float)
-    std = pd.Series(scaler["std"], dtype=float)
-    x = x.fillna(median)
-    x = (x - mean) / std
-    x = pd.concat([x, flags], axis=1)
-    for col in feature_cols:
-        if col not in x.columns:
-            x[col] = 0.0
-    return x[feature_cols].to_numpy(dtype=np.float64)
-
-
-def _group_softmax(values):
-    values = np.asarray(values, dtype=np.float64)
-    values = values - np.nanmax(values)
-    exp_v = np.exp(np.clip(values, -700, 700))
-    total = exp_v.sum()
-    return exp_v / total if total > 0 else np.full(len(values), 1.0 / len(values))
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def build_live_fundamentals(card_json):
-    """Build pre-race features once; live odds are added separately every refresh."""
-    bundle, history = load_quant_assets()
-    card = pd.DataFrame(json.loads(card_json))
-    card["race_date"] = pd.to_datetime(card["race_date"])
-    for col in ("finishing_position", "finish_time_sec", "lbw"):
-        card[col] = np.nan
-    cutoff = card["race_date"].min()
-    history = history[history["race_date"] < cutoff].copy()
-    combined = pd.concat([history, card], ignore_index=True, sort=False)
-    featured = build_features(combined)
-    live = featured[featured["race_id"] == card["race_id"].iloc[0]].copy()
-    live = live.sort_values("horse_no", key=lambda s: pd.to_numeric(s, errors="coerce"))
-    x_live = _model_apply_scaler(live, bundle["scaler"], bundle["feature_cols"])
-    p_model = _group_softmax(x_live @ np.asarray(bundle["cl_beta"], dtype=float))
-    return live[["horse_no", "horse_name"]].assign(p_model=p_model).to_dict("records")
-
-
-def score_live_model(card_rows, win_odds, rebate_rate=0.0, style_history=None, bias_info=None):
-    """Return model metrics plus transparent running-style/track-bias adjustments."""
-    if not MODEL_READY or not card_rows or not win_odds:
-        return pd.DataFrame(), MODEL_IMPORT_ERROR or "\u672a\u6709\u5b8c\u6574\u6392\u4f4d\uff0f\u5373\u6642\u7368\u8d0f\u8ce0\u7387"
-    try:
-        bundle, _ = load_quant_assets()
-        card_json = json.dumps(card_rows, ensure_ascii=False, sort_keys=True, default=str)
-        base = pd.DataFrame(build_live_fundamentals(card_json))
-        base["horse_key"] = base["horse_no"].apply(lambda x: str(int(float(x))))
-        horse_ids = {str(int(float(x.get("horse_no")))): str(x.get("horse_id") or "")
-                     for x in card_rows if x.get("horse_no") is not None}
-        base["horse_id"] = base["horse_key"].map(horse_ids)
-        base["win_odds"] = base["horse_key"].map(
-            {str(int(float(k))): float(v) for k, v in win_odds.items() if float(v) > 0}
-        )
-        base = base.dropna(subset=["win_odds"]).reset_index(drop=True)
-        if len(base) < 2:
-            return pd.DataFrame(), "\u6709\u6548\u7368\u8d0f\u8ce0\u7387\u4e0d\u8db3"
-        race_idx = np.zeros(len(base), dtype=int)
-        p_public = public_probabilities(base["win_odds"].to_numpy(float), race_idx)
-        eps = 1e-12
-        z = (float(bundle["ss_alpha"]) * np.log(np.clip(base["p_model"], eps, 1.0))
-             + float(bundle["ss_beta"]) * np.log(np.clip(p_public, eps, 1.0)))
-        p_final = _group_softmax(z)
-        # These are deliberately small, visible adjustments. They only use
-        # completed same-day evidence and historical style, never future results.
-        style_weight = {"\u653e\u982d": 0.08, "\u524d\u7f6e": 0.04, "\u4e2d\u7f6e": -0.02, "\u5f8c\u4e0a": -0.06}
-        style_names = []
-        style_adj = []
-        bias_adj = []
-        draw_adj = []
-        bias_info = bias_info or {}
-        style_stats = bias_info.get("style_stats") or {}
-        draw_stats = bias_info.get("draw_stats") or {}
-        for _, row in base.iterrows():
-            style = style_from_history(style_history or {}, row.get("horse_id") or row["horse_no"])
-            style_names.append(style)
-            sa = style_weight.get(style, 0.0) if style != "\u672a\u77e5" else 0.0
-            stat = style_stats.get(style) or {}
-            if stat.get("reliable"):
-                sa += max(-0.06, min(0.06, (float(stat.get("lift", 1.0)) - 1.0) * 0.05))
-            try:
-                draw_value = next(x.get("draw") for x in card_rows
-                                  if str(x.get("horse_no")) == str(row["horse_no"]))
-                draw_key = str(int(float(draw_value)))
-            except (StopIteration, TypeError, ValueError):
-                draw_key = ""
-            dstat = draw_stats.get(draw_key) or {}
-            da = max(-0.04, min(0.04, (float(dstat.get("lift", 1.0)) - 1.0) * 0.04)) if dstat.get("reliable") else 0.0
-            style_adj.append(sa)
-            draw_adj.append(da)
-            bias_adj.append(sa + da)
-        adjustment = np.asarray(bias_adj, dtype=float)
-        p_final = _group_softmax(np.log(np.clip(p_final, eps, 1.0)) + adjustment)
-        n_places = 2 if len(base) < 7 else 3
-        if n_places == 2:
-            # Two-place races: sum P(first/second) using fitted lambda2.
-            lam2 = float(bundle["lambda2"])
-            p_place = np.zeros(len(base))
-            for i in range(len(base)):
-                rest = np.delete(p_final, i) ** lam2
-                denom = rest.sum()
-                if denom > 0:
-                    cond = rest / denom
-                    p_place[i] += p_final[i]
-                    p_place[np.arange(len(base)) != i] += p_final[i] * cond
-        else:
-            p_place = place_probs(p_final, float(bundle["lambda2"]), float(bundle["lambda3"]))
-        base["p_public"] = p_public
-        base["p_final"] = p_final
-        base["historical_style"] = style_names
-        base["style_adjustment_pct"] = np.asarray(style_adj) * 100.0
-        base["draw_adjustment_pct"] = np.asarray(draw_adj) * 100.0
-        base["bias_adjustment_pct"] = np.asarray(bias_adj) * 100.0
-        base["fair_odds"] = 1.0 / np.clip(p_final, eps, 1.0)
-        base["overlay_pct"] = (p_final / np.clip(p_public, eps, 1.0) - 1.0) * 100.0
-        base["ev"] = p_final * base["win_odds"] + float(rebate_rate) * (1.0 - p_final)
-        base["p_place"] = np.clip(p_place, 0.0, 1.0)
-        base["value"] = base["ev"] - 1.0
-        return base.sort_values("ev", ascending=False), None
-    except Exception as exc:
-        return pd.DataFrame(), f"\u6a21\u578b\u8a08\u7b97\u5931\u6557\uff1a{exc}"
+# 量化模型已移除（V19-R2.3.0）：原 load_quant_assets 會把整份
+# runs_clean.csv 歷史載入 RAM（約 1.2GB），為省記憶體而刪除。
+# 歷史跑法／偏差面板只讀 races.sqlite（唯讀小查詢），仍保留。
 
 
 def matching_meeting(meetings, date_str, venue):
@@ -1973,50 +1821,7 @@ with upper_panels:
         else:
             st.info('\u7576\u65e5\u5c1a\u672a\u6709\u5df2\u5b8c\u6210\u5834\u6b21\u5206\u6790\uff1b\u7b2c1\u5834\u6703\u5148\u986f\u793a\u6b77\u53f2\u8cc7\u6599\u53ef\u7528\u7a0b\u5ea6\uff0c\u5b8c\u6210\u5f8c\u7531Recorder\u66f4\u65b0\u3002')
 
-    # \u2550\u2550\u2550 MODEL \u5373\u6642\u8a08\u7b97\uff1a\u57fa\u672c\u9762 + HKJC \u5373\u6642\u7368\u8d0f\u8ce0\u7387 \u2550\u2550\u2550
-    st.markdown(
-        '<div class="panel-title" style="margin-top:4px">\U0001f9e0 V19 \u5373\u6642\u91cf\u5316\u6a21\u578b</div>'
-        '<div class="panel-sub">Benter \u7b2c\u4e8c\u968e\uff1a\u6b77\u53f2\u57fa\u672c\u9762\u52dd\u7387 \u00d7 \u99ac\u6703\u5373\u6642\u7368\u8d0f\u5e02\u5834\u6982\u7387\uff1b\u6bcf 5 \u79d2\u96a8\u8ce0\u7387\u66f4\u65b0</div>',
-        unsafe_allow_html=True)
-    _rebate_label = st.radio(
-        "EV \u56de\u6263\u8a2d\u5b9a", ["\u6563\u6236\uff0f\u7121\u56de\u6263", "\u7368\u8d0f\u5408\u8cc7\u683c\u56de\u6263 10%"],
-        horizontal=True, key="model_rebate_mode",
-        help="10% \u56de\u6263\u53ea\u9069\u7528\u65bc\u7b26\u5408\u99ac\u6703\u9580\u6abb\u7684\u8f38\u6ce8\uff1b\u4e00\u822c\u5c0f\u984d\u6295\u6ce8\u8acb\u9078\u7121\u56de\u6263\u3002")
-    _rebate_rate = 0.10 if "10%" in _rebate_label else 0.0
-    _live_win_odds = {
-        str(r["\u99ac\u865f"]): float(r["\u5373\u5834"])
-        for _, r in df[df["\u6c60"] == "WIN"].iterrows()
-        if _to_float(r.get("\u5373\u5834")) > 0
-    }
-    _model_rows = (_ri or {}).get("card_rows") or []
-    _model_df, _model_err = score_live_model(
-        _model_rows, _live_win_odds, _rebate_rate,
-        style_history=_history_styles, bias_info=_day_analysis)
-    if not _model_df.empty:
-        _shown = _model_df[["horse_key", "horse_name", "historical_style", "win_odds", "p_model",
-                            "p_public", "p_final", "overlay_pct", "fair_odds",
-                            "ev", "value", "p_place", "style_adjustment_pct",
-                            "draw_adjustment_pct", "bias_adjustment_pct"]].copy()
-        _shown.columns = ["\u99ac\u865f", "\u99ac\u540d", "\u6b77\u53f2\u8dd1\u6cd5", "\u5373\u6642\u8ce0\u7387", "\u57fa\u672c\u9762\u52dd\u7387", "\u5e02\u5834\u52dd\u7387",
-                          "\u7d9c\u5408\u52dd\u7387", "\u76f4\u535a\u7387", "Fair Odds", "EV", "\u9810\u671f\u56de\u5831", "\u4f4d\u7f6e\u6982\u7387",
-                          "\u8dd1\u6cd5\u8abf\u6574", "\u6a94\u4f4d\u8abf\u6574", "\u504f\u5dee\u5408\u8a08"]
-        _shown["\u99ac\u865f"] = _shown["\u99ac\u865f"].astype(str)
-        for _c in ("\u57fa\u672c\u9762\u52dd\u7387", "\u5e02\u5834\u52dd\u7387", "\u7d9c\u5408\u52dd\u7387", "\u4f4d\u7f6e\u6982\u7387"):
-            _shown[_c] = _shown[_c].map(lambda x: f"{x:.2%}")
-        _shown["\u76f4\u535a\u7387"] = _shown["\u76f4\u535a\u7387"].map(lambda x: f"{x:+.1f}%")
-        _shown["Fair Odds"] = _shown["Fair Odds"].map(lambda x: f"{x:.2f}")
-        _shown["\u5373\u6642\u8ce0\u7387"] = _shown["\u5373\u6642\u8ce0\u7387"].map(lambda x: f"{x:.1f}")
-        _shown["EV"] = _shown["EV"].map(lambda x: f"{x:.3f}")
-        _shown["\u9810\u671f\u56de\u5831"] = _shown["\u9810\u671f\u56de\u5831"].map(lambda x: f"{x:+.1%}")
-        for _c in ("\u8dd1\u6cd5\u8abf\u6574", "\u6a94\u4f4d\u8abf\u6574", "\u504f\u5dee\u5408\u8a08"):
-            _shown[_c] = _shown[_c].map(lambda x: f"{x:+.1f}%")
-        st.dataframe(_shown, hide_index=True, use_container_width=True)
-        _value_count = int((_model_df["ev"] > 1.0).sum())
-        st.caption(
-            f"\u5373\u6642\u8fa8\u8b58 {_value_count} \u5339 EV > 1\uff1b\u76f4\u535a\u7387 = \u7d9c\u5408\u52dd\u7387 \u00f7 \u5e02\u5834\u52dd\u7387 \u2212 1\u3002"
-            "\u7d9c\u5408\u52dd\u7387\u53ca\u4f4d\u7f6e\u6982\u7387\u70ba\u6a21\u578b\u4f30\u7b97\uff0c\u4e26\u975e\u4fdd\u8b49\u7d50\u679c\u3002")
-    else:
-        st.info(f"\u6a21\u578b\u7b49\u5f85\u8cc7\u6599\uff1a{_model_err or '\u6392\u4f4d\u6216\u7368\u8d0f\u8ce0\u7387\u5c1a\u672a\u9f4a\u5168'}")
+    # 量化模型已移除（V19-R2.3.0 NOMODEL）：省 RAM，不再載入歷史 CSV。
 
 
 
