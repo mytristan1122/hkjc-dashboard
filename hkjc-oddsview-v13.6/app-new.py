@@ -85,7 +85,7 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V19-R2.2.2-SWITCH-FIX-20261001"
+APP_VERSION = "V19-R2.2.3-RACE-FIX-20261001"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -1606,8 +1606,16 @@ def load_snapshots(race_key):
             del entry['files'][name]
             changed = True
     if changed:
-        unique = {value[1]['ts']: value[1] for value in entry['files'].values()}
-        entry['snaps'] = [unique[k] for k in sorted(unique)]
+        # 修正 "dictionary changed size during iteration"：autorefresh 令兩個
+        # script run 重疊，上一個 run 喺度 iterate entry['files']，下一個 run
+        # 同時改佢（session_state 共享同一 dict）。先用 list() materialize 一份
+        # 快照縮短 race window，再用 try/except 兜底：萬一仍然撞中，就保留上次
+        # 嘅 snaps，下一個 refresh 會自動補返，畫面唔會 crash 或白屏。
+        try:
+            unique = {value[1]['ts']: value[1] for value in list(entry['files'].values())}
+            entry['snaps'] = [unique[k] for k in sorted(unique)]
+        except RuntimeError:
+            pass
     st.session_state['_archive_error'] = '; '.join(errors[:3])
     # Bound loaded races; selected race remains resident.
     for other in list(cache):
