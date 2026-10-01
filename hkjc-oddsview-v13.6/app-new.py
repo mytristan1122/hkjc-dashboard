@@ -85,11 +85,31 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V19-R2.2.1-REPLAY-FIX-20260929"
+APP_VERSION = "V19-R2.2.2-SWITCH-FIX-20261001"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
                    initial_sidebar_state="collapsed")
+
+# bfcache 自動重連：切 tab / minimize 返嚟時，瀏覽器會把頁面放入 Back-Forward
+# Cache 並 cut 咗條 WebSocket，令畫面凍結（秒數唔跳、撳嘢冇反應）。偵測到頁面
+# 由 bfcache 返嚟（pageshow 嘅 e.persisted）就自動 reload 重連，唔使手動 F5。
+import streamlit.components.v1 as _components
+_components.html("""
+<script>
+(function(){
+  var w = window.top || window;
+  try {
+    if (!w.__bfcacheReloadHooked) {
+      w.__bfcacheReloadHooked = true;
+      w.addEventListener('pageshow', function(e){ if (e.persisted) { w.location.reload(); } });
+    }
+  } catch (err) {
+    window.addEventListener('pageshow', function(e){ if (e.persisted) { location.reload(); } });
+  }
+})();
+</script>
+""", height=0)
 
 # \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 #  DISK STORAGE (\u6c38\u4e45\u5132\u5b58 \u2014 \u5beb\u843d\u786c\u789f\uff0c\u91cd\u555f\u5514\u5931)
@@ -1701,7 +1721,12 @@ else:
         if meetings:
             today = datetime.now(HKT).date().isoformat()
             default = next((i for i, m in enumerate(meetings) if m['date'] >= today), 0)
-            mi = st.selectbox('\u8cfd\u4e8b\uff08\u81ea\u52d5\u540c\u6b65\u99ac\u6703\uff09', range(len(meetings)), index=default,
+            # \u7d81\u56fa\u5b9a key\uff0c\u4ee4\u63c0\u5497\u5605\u8cfd\u4e8b\u5514\u6703\u4ffe\u6bcf 5 \u79d2 autorefresh rerun \u6d17\u8fd4\u9810\u8a2d\u3002
+            # \u8cfd\u671f\u6578\u76ee\u6703\u8b8a\uff08\u65b0\u8cfd\u4e8b\u65e5\uff09\uff0c\u820a\u5b58\u503c\u82e5\u8d85\u51fa\u7bc4\u570d\u5c31\u5148\u6e05\u8d70\uff0cfallback \u53bb default\u3002
+            if st.session_state.get('meeting_sel_v19') not in range(len(meetings)):
+                st.session_state.pop('meeting_sel_v19', None)
+            mi = st.selectbox('\u8cfd\u4e8b\uff08\u81ea\u52d5\u540c\u6b65\u99ac\u6703\uff09', range(len(meetings)),
+                index=default, key='meeting_sel_v19',
                 format_func=lambda i: f"{meetings[i]['date']} \u00b7 {venue_label(meetings[i]['venue'])} ({meetings[i]['venue']}) \u00b7 {meetings[i]['n_races']}\u5834")
             meeting = meetings[mi]
             race_date, course = date.fromisoformat(meeting['date']), meeting['venue']
@@ -1715,7 +1740,19 @@ else:
         else:
             st.write(venue_label(course))
     with c3:
-        race_no = st.number_input('\u5834\u6b21', 1, max_race, 1)
+        # \u7d81\u56fa\u5b9a key \u4fc2\u6838\u5fc3\u4fee\u6b63\uff1a\u5187 key \u5605 number_input \u55ba\u6709 st_autorefresh \u5605\u74b0\u5883\u4e0b\uff0c
+        # \u4f60\u64b3 +/- \u53bb\u7b2c 2 \u5834\uff0c\u4e0b\u4e00\u500b 5 \u79d2 autorefresh rerun \u6703\u628a\u500b\u503c\u6d17\u8fd4\u9810\u8a2d\u7b2c 1 \u5834\uff0c
+        # \u4ee4\u4f60\u9ede\u64b3\u90fd\u8fd4\u7b2c 1 \u5834\u3002pin \u4f4f key \u4e4b\u5f8c\u500b\u5834\u6b21\u865f\u5c31\u7a69\u5b9a\u3002
+        # \u5207\u53bb\u5834\u6b21\u8f03\u5c11\u5605\u8cfd\u4e8b\u6642\uff0c\u820a\u5b58\u503c\u53ef\u80fd\u8d85\u51fa\u65b0 max_race\uff0c\u5148 clamp \u5165\u5408\u6cd5\u7bc4\u570d\uff0c
+        # \u907f\u514d StreamlitValueAboveMaxError\u3002
+        _rn = st.session_state.get('race_no_v19')
+        if _rn is not None:
+            try:
+                st.session_state['race_no_v19'] = max(1, min(int(_rn), max_race))
+            except (TypeError, ValueError):
+                st.session_state['race_no_v19'] = 1
+        race_no = st.number_input('\u5834\u6b21', min_value=1, max_value=max_race,
+                                  step=1, key='race_no_v19')
     race_key = f'{race_date}|{course}|{int(race_no)}'
 with c4:
     post_input = st.text_input('\u958b\u8dd1\u6642\u9593 (\u53ef\u9078)', '', placeholder='HH:MM', key=f'post::{race_key}::{replay_mode}')
