@@ -1,0 +1,161 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+:root{--bg:#0b0e14;--surface:#141925;--card:#161b27;--border:#222b3a;--text:#e6edf3;--subtext:#9aa7b8;
+--muted:#5b6675;--accent:#50aaff;--good:#2ecb77;--warn:#ff8c3c;--hot:#c878ff;--gold:#e0a83c;--red:#ff5757;
+--mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+--sans:'Inter',system-ui,-apple-system,'PingFang HK','Microsoft JhengHei',sans-serif;color-scheme:dark;}
+*{box-sizing:border-box}html,body{margin:0;background:transparent}
+body{color:var(--text);font-family:var(--sans);font-size:14px;-webkit-font-smoothing:antialiased;
+font-variant-numeric:tabular-nums}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:stretch}
+.ctl{display:flex;flex-direction:column;gap:3px;background:var(--card);border:1px solid var(--border);
+border-radius:9px;padding:7px 11px;min-width:0}
+.ctl label{font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+.ctl .v{font-size:13px;font-weight:600;color:var(--text);white-space:nowrap}
+.ctl.mode .v{color:var(--good)} .ctl.mode.replay .v{color:var(--warn)}
+.seg{display:flex;gap:5px}
+.seg .opt{display:flex;align-items:center;gap:5px;font-size:12px;font-weight:600;color:var(--subtext);
+background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:3px 10px;cursor:pointer;white-space:nowrap}
+.seg .opt.on{color:var(--text);border-color:rgba(80,170,255,.55);background:rgba(80,170,255,.12)}
+.seg .opt .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.seg .opt.on.live .dot{background:var(--red)}
+.seg .opt.on.replay .dot{background:var(--warn)}
+select.dd,input.inp{background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);
+font-size:13px;font-weight:600;font-family:var(--sans);padding:3px 7px;outline:none;max-width:230px}
+select.dd:focus,input.inp:focus{border-color:rgba(80,170,255,.55)}
+input.inp::placeholder{color:var(--muted);font-weight:400}
+input.th{width:46px;background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--text);
+font-family:var(--mono);font-size:12px;font-weight:600;padding:2px 4px;text-align:center;outline:none}
+input.th:focus{border-color:rgba(80,170,255,.6)}
+input.th::-webkit-outer-spin-button,input.th::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.sens{display:flex;gap:4px;align-items:center;font-size:12px}
+.btn{background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text);
+font-size:12px;font-weight:600;padding:0 12px;cursor:pointer;align-self:stretch}
+.btn:hover{border-color:rgba(80,170,255,.5)}
+.saved{font-size:10px;color:var(--good);margin-top:2px;min-height:12px}
+.disp{color:var(--subtext)}
+</style>
+</head>
+<body>
+<div class="controls" id="root"></div>
+<script>
+// ── Streamlit component protocol (vanilla, no build) ──
+function post(msg){ window.parent.postMessage(Object.assign({isStreamlitMessage:true}, msg), "*"); }
+const Streamlit = {
+  ready(){ post({type:"streamlit:componentReady", apiVersion:1}); },
+  height(h){ post({type:"streamlit:setFrameHeight", height: (h==null?document.documentElement.scrollHeight:h)}); },
+  value(v){ post({type:"streamlit:setComponentValue", dataType:"json", value:v}); },
+};
+let DATA = null, STATE = null, NONCE = 0, savedTimer = null;
+
+function initState(d){
+  // seed editable state from Python args (only first time or when key changes)
+  return {
+    mode: d.mode || 'LIVE',
+    meeting_index: d.meeting_index||0,
+    race_no: d.race_no||1,
+    replay_index: d.replay_index||0,
+    post: d.post||'',
+    p1:d.sens.p1, p2:d.sens.p2, p3:d.sens.p3,
+    a1:d.sens.a1, a2:d.sens.a2, a3:d.sens.a3,
+    reset:false
+  };
+}
+function emit(markSaved){
+  NONCE++;
+  const v = Object.assign({nonce:NONCE}, STATE);
+  Streamlit.value(v);
+  if(markSaved){
+    const el=document.getElementById('savedTag');
+    if(el){ el.textContent='💾 已儲存 ✓'; clearTimeout(savedTimer);
+      savedTimer=setTimeout(()=>{el.textContent='💾 已儲存';},1500); }
+  }
+}
+const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+function render(d){
+  const rep = STATE.mode==='REPLAY';
+  let h='';
+  // 模式 toggle
+  h+=`<div class="ctl mode ${rep?'replay':''}"><label>模式</label>
+    <div class="seg">
+      <span class="opt live ${rep?'':'on'}" data-act="mode" data-v="LIVE"><span class="dot"></span>LIVE</span>
+      <span class="opt replay ${rep?'on':''}" data-act="mode" data-v="REPLAY"><span class="dot"></span>REPLAY</span>
+    </div></div>`;
+  if(!rep){
+    // 賽事 (meetings)
+    const opts=(d.meetings||[]).map(m=>`<option value="${m.i}" ${m.i===STATE.meeting_index?'selected':''}>${esc(m.label)}</option>`).join('');
+    h+=`<div class="ctl"><label>賽事</label><select class="dd" data-act="meeting">${opts||'<option>—</option>'}</select></div>`;
+    h+=`<div class="ctl"><label>場地</label><span class="v disp">${esc(d.venue_label||'—')}</span></div>`;
+    // 場次 1..max
+    let ro=''; for(let i=1;i<=(d.max_race||14);i++){ ro+=`<option value="${i}" ${i===STATE.race_no?'selected':''}>第 ${i} 場</option>`; }
+    h+=`<div class="ctl"><label>場次</label><select class="dd" data-act="race_no">${ro}</select></div>`;
+  }else{
+    h+=`<div class="ctl"><label>場地</label><span class="v disp">${esc(d.venue_label||'—')}</span></div>`;
+    h+=`<div class="ctl"><label>場次</label><span class="v disp">第 ${STATE.race_no} 場</span></div>`;
+    const opts=(d.replay||[]).map(m=>`<option value="${m.i}" ${m.i===STATE.replay_index?'selected':''}>${esc(m.label)}</option>`).join('');
+    h+=`<div class="ctl"><label>揀場次（REPLAY）</label><select class="dd" data-act="replay">${opts||'<option>—</option>'}</select></div>`;
+  }
+  // 開跑時間
+  h+=`<div class="ctl"><label>開跑時間（可選）</label><input class="inp" style="width:80px" data-act="post" value="${esc(STATE.post)}" placeholder="HH:MM"></div>`;
+  // 資料來源
+  h+=`<div class="ctl"><label>資料來源</label><span class="v disp">${esc(d.source||'')}</span></div>`;
+  // 敏感度 佔比
+  h+=`<div class="ctl"><label>敏感度·佔比（% 可改）</label>
+    <span class="sens">⚡<input class="th" type="number" step="0.1" data-act="p1" value="${STATE.p1}">🔥<input class="th" type="number" step="0.1" data-act="p2" value="${STATE.p2}">💥<input class="th" type="number" step="0.1" data-act="p3" value="${STATE.p3}">%</span></div>`;
+  // 敏感度 金額
+  h+=`<div class="ctl"><label>敏感度·金額（K 可改）</label>
+    <span class="sens">⚡$<input class="th" type="number" step="1" data-act="a1" value="${STATE.a1}">🔥$<input class="th" type="number" step="1" data-act="a2" value="${STATE.a2}">💥$<input class="th" type="number" step="1" data-act="a3" value="${STATE.a3}">K</span>
+    <span class="saved" id="savedTag">💾 已儲存</span></div>`;
+  // 重設
+  h+=`<button class="btn" data-act="reset">🔄 重設此場走勢</button>`;
+  document.getElementById('root').innerHTML=h;
+  bind();
+  Streamlit.height();
+}
+
+function bind(){
+  // mode / meeting / race_no / replay : change → emit immediately
+  document.querySelectorAll('[data-act="mode"]').forEach(el=>el.onclick=()=>{
+    if(STATE.mode!==el.dataset.v){ STATE.mode=el.dataset.v; render(DATA); emit(false); }
+  });
+  const sel=(act,fn)=>{const e=document.querySelector(`select[data-act="${act}"]`); if(e) e.onchange=()=>{ fn(e.value); emit(false); render(DATA); };};
+  sel('meeting', v=>STATE.meeting_index=parseInt(v,10));
+  sel('race_no', v=>STATE.race_no=parseInt(v,10));
+  sel('replay',  v=>STATE.replay_index=parseInt(v,10));
+  // post : emit on Enter or blur
+  const pe=document.querySelector('input[data-act="post"]');
+  if(pe){ const commit=()=>{ STATE.post=pe.value.trim(); emit(false); };
+    pe.onkeydown=(ev)=>{ if(ev.key==='Enter'){ ev.preventDefault(); commit(); } };
+    pe.onblur=commit; }
+  // sensitivity : emit on input (debounced via saved tag), persist on change
+  ['p1','p2','p3','a1','a2','a3'].forEach(act=>{
+    const e=document.querySelector(`input[data-act="${act}"]`);
+    if(e) e.oninput=()=>{ const val=parseFloat(e.value); if(!isNaN(val)){ STATE[act]=val; emit(true); } };
+  });
+  const rb=document.querySelector('button[data-act="reset"]');
+  if(rb) rb.onclick=()=>{ STATE.reset=true; emit(false); STATE.reset=false; };
+}
+
+// receive render from Streamlit
+window.addEventListener("message", (e)=>{
+  if(!e.data || e.data.type!=="streamlit:render") return;
+  const args = e.data.args || {};
+  DATA = args.data || {};
+  // seed STATE only once (first render); afterwards keep user edits
+  if(STATE===null){ STATE = initState(DATA); render(DATA); }
+  else {
+    // keep user's edits; skip re-render while a field is focused (avoid interrupting typing on 5s refresh)
+    const ae=document.activeElement;
+    if(!ae || !/INPUT|SELECT/.test(ae.tagName)) render(DATA);
+  }
+});
+Streamlit.ready();
+Streamlit.height(96);
+</script>
+</body>
+</html>
