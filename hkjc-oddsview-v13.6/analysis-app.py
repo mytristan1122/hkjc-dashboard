@@ -371,248 +371,344 @@ def _lift_rows_html(rows):
     return h or '<div class="psub">樣本不足</div>'
 
 
-# ════════════════════════ CSS ════════════════════════
-st.markdown("""<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
-:root{--bg:#0b0e14;--surface:#141925;--card:#161b27;--border:#222b3a;--text:#e6edf3;
---subtext:#9aa7b8;--muted:#5b6675;--accent:#50aaff;--good:#2ecb77;--gold:#e0a83c;
---mono:'JetBrains Mono',ui-monospace,monospace;}
-html,body,.stApp{background:var(--bg)!important;color:var(--text);
-font-family:'Inter',system-ui,-apple-system,'PingFang HK','Microsoft JhengHei',sans-serif;}
-#MainMenu,footer,header,[data-testid="stToolbar"]{visibility:hidden;}
-.block-container{padding:0.6rem 1.3rem 2rem!important;max-width:100%!important;}
-[data-testid="stVerticalBlock"]{gap:0.45rem!important;}
-[data-testid="stElementContainer"]{margin:0!important;}
-/* ── Streamlit 原生 widget 壓深壓細（貼近 template chip）── */
-[data-testid="stWidgetLabel"] p,[data-testid="stWidgetLabel"] label{font-size:9px!important;
-letter-spacing:.05em;text-transform:uppercase;color:var(--muted)!important;margin-bottom:2px!important;font-weight:600;}
-div[data-baseweb="select"]>div{background:var(--card)!important;border-color:var(--border)!important;
-min-height:32px!important;font-size:13px!important;color:var(--text)!important;border-radius:8px!important;}
-div[data-baseweb="select"] *{color:var(--text)!important;}
-[data-testid="stNumberInput"] input,[data-testid="stTextInput"] input{background:var(--card)!important;
-color:var(--text)!important;font-family:var(--mono)!important;font-weight:600;font-size:13px!important;}
-[data-testid="stNumberInput"] div[data-baseweb="input"],
-[data-testid="stNumberInputContainer"]{background:var(--card)!important;border-color:var(--border)!important;border-radius:8px!important;}
-[data-testid="stNumberInput"] button{background:var(--surface)!important;border-color:var(--border)!important;}
-.stButton>button{background:var(--good)!important;color:#06220f!important;border:0!important;
-border-radius:8px!important;font-weight:600!important;font-size:12px!important;padding:6px 12px!important;margin-top:16px!important;}
-div[data-baseweb="popover"] *,[data-baseweb="menu"] *{background:var(--card)!important;color:var(--text)!important;}
-[data-baseweb="tag"]{background:rgba(80,170,255,.18)!important;}
-/* ── header ── */
-.hdr{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 15px;background:var(--surface);
-border:1px solid var(--border);border-radius:10px;}
-.hdr b{font-size:16px;} .badge{font-family:var(--mono);font-size:11px;color:var(--accent);
-background:rgba(80,170,255,.12);border:1px solid rgba(80,170,255,.35);padding:3px 9px;border-radius:20px;}
-/* ── 賽事資料 header ── */
-.rhdr{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin-top:10px;}
-.rhdr .l1{font-size:15px;font-weight:600;}
-.rhdr .l1 .nv{color:var(--good);font-size:12px;margin-left:8px;}
-.rhdr .l2{margin-top:5px;display:flex;gap:7px;flex-wrap:wrap;}
-.rchip{background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:1px 7px;font-size:11px;color:var(--subtext);}
-/* ── 因子三格 ── */
-.factors{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:9px;margin-top:9px;}
-.panel{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:11px 13px;}
-.ptitle{font-size:12px;font-weight:600;margin-bottom:7px;}
-.psub{font-size:10px;color:var(--muted);margin-top:5px;}
-.bias{font-size:14px;font-weight:600;color:var(--gold);}
-.frow{display:flex;justify-content:space-between;font-size:12px;padding:2px 0;}
-.fk{color:var(--subtext);} .lup{color:var(--good);font-weight:600;font-family:var(--mono);}
-.ldn{color:#ff6b6b;font-weight:600;font-family:var(--mono);} .lmid{color:var(--subtext);font-family:var(--mono);}
-.nn{font-family:var(--mono);font-size:10px;color:var(--muted);font-weight:400;}
-/* ── 分析表 ── */
-table.an{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:tabular-nums;}
-table.an th{position:sticky;top:0;background:var(--card);text-align:right;font-size:9px;color:var(--muted);
-padding:6px 7px;border-bottom:1px solid var(--border);white-space:nowrap;}
-table.an th.l,table.an td.l{text-align:left;}
-table.an td{text-align:right;padding:6px 7px;border-bottom:1px solid rgba(34,43,58,.5);
-font-family:var(--mono);white-space:nowrap;}
-table.an tbody tr:hover td{background:rgba(80,170,255,.12);}
-table.an tr.val td{background:rgba(46,203,119,.08);}
-table.an tr.val:hover td{background:rgba(46,203,119,.15);}
-.p1{color:#ffd43b;background:rgba(255,212,59,.12);} .p2{color:#9ae6b4;background:rgba(46,203,119,.12);}
-.p3{color:#9aa7b8;background:rgba(154,167,184,.12);} .p4{color:#8ab4ff;background:rgba(80,170,255,.12);}
-.chip{border-radius:5px;padding:1px 6px;font-family:'Inter',sans-serif;font-weight:600;}
-.fg{color:var(--good);} .fm{color:var(--subtext);} .fb{color:#ff6b6b;}
-.evpos{color:var(--good);font-weight:700;} .evneg{color:var(--muted);}
-.stake{color:var(--gold);font-weight:600;} .pl{color:var(--accent);}
-</style>""", unsafe_allow_html=True)
+
+
+# ════════════════════════ 組裝畀 template 嘅數據 ════════════════════════
+PACE_NUM = {"放頭": 1, "前置": 2, "中置": 3, "後置": 4, "後上": 4}
+FIT_CODE = {"佳": "good", "一般": "mid", "不利": "bad"}
+
+
+def _rnd(x, n=4):
+    try:
+        v = float(x)
+        return None if v != v else round(v, n)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_meeting(date_str, venue):
+    cards, meta, win_pool = fetch_cards(date_str, venue)
+    if cards.empty:
+        return None
+    scored = score_day(cards.to_json(), model_src + str(bundle.get("trained_at")))
+    _brows, blabel, bdone = today_bias(date_str, venue)
+    races = []
+    for rno in sorted(scored["race_no"].unique()):
+        g = scored[scored["race_no"] == rno]
+        m = meta.get(int(rno), {})
+        dist = m.get("dist"); going = (m.get("going") or "").upper()
+        plist, pbase = pace_lift(pace, dist)
+        dlist, dbase = draw_lift(hist, dist)
+        horses = []
+        for _, r in g.iterrows():
+            dl, gl = fitness_labels(hist, r["horse_id"], dist, going)
+            sname, _spct = dominant_style(style, r["horse_id"])
+            od = r["win_odds"]; od = float(od) if (od == od and od > 0) else None
+            draw_v = int(r["draw"]) if r["draw"] == r["draw"] else None
+            horses.append({
+                "no": int(r["horse_no"]), "nm": r["horse_name"], "draw": draw_v,
+                "pace": PACE_NUM.get(sname, 5),
+                "dist": FIT_CODE.get(dl, "unknown"), "going": FIT_CODE.get(gl, "unknown"),
+                "odds": _rnd(od, 2), "pm": _rnd(r["p_model"]), "pk": _rnd(r["p_public"]),
+                "pf": _rnd(r["p_final"]), "pl": _rnd(r["p_place"]),
+                "ev": (_rnd(r["ev"], 3) if od is not None else None)})
+        chips = [c for c in [m.get("cls"),
+                             (f'場地：{m.get("going")}' if m.get("going") else None),
+                             (f'跑道 {m.get("course")}' if m.get("course") else None),
+                             f'{len(horses)} 匹出賽'] if c]
+        dm = f"{int(dist)}M" if (dist == dist and dist) else "?M"
+        bias_sub = (f'已完成：{", ".join("第%d場" % n for n in bdone)}'
+                    if bdone else "今日尚未有已完成場次；頭幾場完成後逐場更新。")
+        races.append({
+            "no": int(rno), "title": f"第 {int(rno)} 場 · {dm}", "chips": chips,
+            "bias": blabel if bdone else "樣本不足", "bias_sub": bias_sub,
+            "dist": int(dist) if (dist == dist and dist) else None,
+            "pbase": round(pbase, 4), "dbase": round(dbase, 4),
+            "pace": [[n, round(rt, 4), round(lf, 3)] for n, rt, lf in plist],
+            "draw": [[n, round(rt, 4), round(lf, 3)] for n, rt, lf in dlist],
+            "horses": horses})
+    return {"label": f"{date_str} · {venue_label(venue)}",
+            "venue": f"{venue_label(venue)} {venue}", "races": races}
+
+
+def build_data(meetings):
+    out, errs = [], []
+    for mtg in meetings[:4]:   # 最多 4 個賽馬日，控制成本
+        try:
+            md = build_meeting(mtg["date"], mtg["venue"])
+            if md and md["races"]:
+                out.append(md)
+        except Exception as e:
+            errs.append(f'{mtg["date"]} {mtg["venue"]}: {e}')
+    return out, errs
+
+
+# ════════════════════════ Template（= 你定稿 artifact，數據驅動）════════════════════════
+TEMPLATE_HTML = r"""
+<style>
+:root{--bg:#0b0e14;--surface:#141925;--card:#161b27;--border:#222b3a;--text:#e6edf3;--subtext:#9aa7b8;
+--muted:#5b6675;--accent:#50aaff;--good:#2ecb77;--warn:#ff8c3c;--hot:#c878ff;--gold:#e0a83c;
+--mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+--sans:'Inter',system-ui,-apple-system,'PingFang HK','Microsoft JhengHei',sans-serif;color-scheme:dark;}
+*{box-sizing:border-box} html,body{margin:0}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.45;
+padding:6px 4px 24px;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
+.wrap{max-width:1250px;margin:0 auto}
+.hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
+padding:11px 15px;background:var(--surface);border:1px solid var(--border);border-radius:10px}
+.hdr-l{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.hdr-title{font-size:16px;font-weight:600}
+.badge{font-family:var(--mono);font-size:11px;color:var(--accent);background:rgba(80,170,255,.12);
+border:1px solid rgba(80,170,255,.35);padding:3px 9px;border-radius:20px}
+.upd{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.ctl{display:flex;flex-direction:column;gap:3px;background:var(--card);border:1px solid var(--border);
+border-radius:9px;padding:7px 11px;min-width:0}
+.ctl label{font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.ctl .v{font-size:13px;font-weight:600;color:var(--text);white-space:nowrap}
+.vsel{background:var(--surface);border:1px solid var(--border);color:var(--text);font-family:var(--sans);
+font-size:13px;font-weight:600;border-radius:6px;padding:3px 6px;cursor:pointer;outline:none}
+.binput{background:var(--surface);border:1px solid var(--accent);border-radius:6px;color:var(--text);
+font-family:var(--mono);font-size:13px;font-weight:600;padding:3px 8px;width:92px;outline:none}
+.binput:focus{box-shadow:0 0 0 2px rgba(80,170,255,.25)}
+.pick{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;vertical-align:middle}
+#dutchout .drow{display:flex;justify-content:space-between;gap:12px;font-size:12px;padding:4px 2px;border-bottom:1px solid rgba(34,43,58,.45)}
+#dutchout .dsum{margin-top:10px;font-size:12px;line-height:1.75}
+.racehdr{margin-top:12px;padding:11px 14px;background:var(--card);border:1px solid var(--border);border-radius:10px}
+.racehdr .line1{font-size:15px;font-weight:600}
+.racehdr .line2{font-size:12px;color:var(--subtext);margin-top:3px;display:flex;gap:7px;flex-wrap:wrap}
+.chip{background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:1px 7px;font-size:11px}
+.factors{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:9px;margin-top:11px}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:11px 13px;min-width:0}
+.panel-title{font-size:12px;font-weight:600;color:var(--text);margin-bottom:7px}
+.panel-sub{font-size:10px;color:var(--muted);margin-top:6px}
+.frow{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;padding:2px 0}
+.frow .k{color:var(--subtext)} .frow .lift{font-family:var(--mono);font-weight:600}
+.lift.up{color:var(--good)} .lift.dn{color:#ff6b6b} .lift.mid{color:var(--subtext)}
+.bias{font-size:13px;font-weight:600;color:var(--gold)} .n{font-family:var(--mono);font-size:10px;color:var(--muted)}
+.tblwrap{margin-top:12px;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
+.tbltop{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:9px}
+.tbltitle{font-size:13px;font-weight:600} .sorthint{font-size:11px;color:var(--muted)}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{border-collapse:collapse;width:100%;min-width:1240px}
+thead th{position:sticky;top:0;background:var(--card);text-align:right;font-size:9px;font-weight:600;
+letter-spacing:.03em;color:var(--muted);padding:6px 8px;border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none}
+thead th:hover{color:var(--subtext)} thead th.active{color:var(--accent)}
+thead th .ind{color:var(--accent);font-size:9px;font-family:var(--mono)} thead th.l{text-align:left}
+tbody td{text-align:right;font-size:12px;padding:6px 8px;border-bottom:1px solid rgba(34,43,58,.55);font-family:var(--mono);white-space:nowrap}
+tbody td.l{text-align:left;font-family:var(--sans)}
+tbody tr:hover td{background:rgba(80,170,255,.12)}
+tbody tr.ev-pos td{background:rgba(46,203,119,.07)} tbody tr.ev-pos:hover td{background:rgba(46,203,119,.15)}
+.no{color:var(--text);font-weight:600} .nm{color:var(--text)}
+.draw{display:inline-block;min-width:20px;text-align:center;background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:0 5px;font-size:11px}
+.draw.inside{color:var(--good);border-color:rgba(46,203,119,.4)} .draw.outside{color:#ff8c3c;border-color:rgba(255,140,60,.35)}
+.pace{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:600;font-family:var(--sans)}
+.pace.p1{color:#ffd43b;background:rgba(255,212,59,.12)} .pace.p2{color:#9ae6b4;background:rgba(46,203,119,.12)}
+.pace.p3{color:#9aa7b8;background:rgba(154,167,184,.12)} .pace.p4{color:#8ab4ff;background:rgba(80,170,255,.12)}
+.pace.p5{color:var(--muted);background:rgba(91,102,117,.12)}
+.fit{font-family:var(--sans);font-size:11px} .fit.good{color:var(--good)} .fit.mid{color:var(--subtext)} .fit.bad{color:#ff6b6b}
+.ev{font-weight:700} .ev.pos{color:var(--good)} .ev.neg{color:var(--muted)}
+.ret.pos{color:var(--good)} .ret.neg{color:#8a94a3}
+.stake{color:var(--gold);font-weight:600;font-family:var(--mono)} .payout{color:var(--subtext);font-family:var(--mono)}
+.foot{margin-top:14px;font-size:11px;color:var(--muted);line-height:1.6} .foot b{color:var(--subtext)}
+.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:7px;font-size:10px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:4px} .dot{width:8px;height:8px;border-radius:2px;display:inline-block}
+</style>
+<div class="wrap">
+  <div class="hdr">
+    <div class="hdr-l"><span style="font-size:18px">🐎</span>
+      <span class="hdr-title">HKJC 賽馬日分析</span>
+      <span class="badge">8502-V1</span>
+      <span class="upd" id="modelline"></span></div>
+    <div class="hdr-r"><span class="upd" id="upd"></span></div>
+  </div>
+  <div class="controls">
+    <div class="ctl"><label>賽馬日</label><select id="selMeet" class="vsel" onchange="onMeet()"></select></div>
+    <div class="ctl"><label>場地</label><span class="v" id="venueLbl"></span></div>
+    <div class="ctl"><label>場次</label><select id="selRace" class="vsel" onchange="onRace()"></select></div>
+    <div class="ctl"><label>EV 回扣</label><span class="v">獨贏 10%</span></div>
+    <div class="ctl"><label>單場本金 (HK$100–10000)</label><input id="bankroll" class="binput" type="number" value="1000" min="100" max="10000" step="100"></div>
+    <div class="ctl"><label>刷新</label><span class="v">每 60 秒</span></div>
+    <div class="ctl"><label>資料來源</label><span class="v">直連 HKJC</span></div>
+  </div>
+  <div class="racehdr" id="racehdr"></div>
+  <div class="factors" id="factors"></div>
+  <div class="tblwrap">
+    <div class="tbltop"><div class="tbltitle">📊 每匹馬分析 · 綜合勝率 × 即場賠率 → EV</div>
+      <div class="sorthint">撳任何欄位標題排序（再撳一次反序 ▲▼）</div></div>
+    <div class="scroll"><table><thead><tr id="hdr">
+      <th class="l" style="width:26px;cursor:default;text-align:center">選</th>
+      <th class="l" data-k="no" data-t="num" data-d="asc" onclick="sortCol(this)">馬號<span class="ind"></span></th>
+      <th class="l" data-k="nm" data-t="txt" data-d="asc" onclick="sortCol(this)">馬名<span class="ind"></span></th>
+      <th data-k="draw" data-t="num" data-d="asc" onclick="sortCol(this)">檔位<span class="ind"></span></th>
+      <th class="l" data-k="pace" data-t="num" data-d="asc" onclick="sortCol(this)">歷史跑法<span class="ind"></span></th>
+      <th class="l" data-k="dist" data-t="rank" data-d="desc" onclick="sortCol(this)">距離<span class="ind"></span></th>
+      <th class="l" data-k="going" data-t="rank" data-d="desc" onclick="sortCol(this)">場地<span class="ind"></span></th>
+      <th data-k="odds" data-t="num" data-d="asc" onclick="sortCol(this)">即場賠率<span class="ind"></span></th>
+      <th data-k="pm" data-t="num" data-d="desc" onclick="sortCol(this)">基本面勝率<span class="ind"></span></th>
+      <th data-k="pk" data-t="num" data-d="desc" onclick="sortCol(this)">市場勝率<span class="ind"></span></th>
+      <th data-k="pf" data-t="num" data-d="desc" onclick="sortCol(this)">綜合勝率<span class="ind"></span></th>
+      <th data-k="pl" data-t="num" data-d="desc" onclick="sortCol(this)">位置概率<span class="ind"></span></th>
+      <th data-k="fair" data-t="num" data-d="asc" onclick="sortCol(this)">Fair<span class="ind"></span></th>
+      <th id="thEV" data-k="ev" data-t="num" data-d="desc" onclick="sortCol(this)">EV<span class="ind"></span></th>
+      <th data-k="ret" data-t="num" data-d="desc" onclick="sortCol(this)">預期回報<span class="ind"></span></th>
+      <th data-k="stake" data-t="num" data-d="desc" onclick="sortCol(this)">建議注碼<span class="ind"></span></th>
+      <th data-k="payout" data-t="num" data-d="desc" onclick="sortCol(this)">若中派彩<span class="ind"></span></th>
+      <th data-k="netwin" data-t="num" data-d="desc" onclick="sortCol(this)">派彩減本金<span class="ind"></span></th>
+    </tr></thead><tbody id="tb"></tbody></table></div>
+    <div class="legend">
+      <span><span class="dot" style="background:rgba(46,203,119,.5)"></span>EV &gt; 1.0（有價值，綠底）</span>
+      <span><span class="pace p1" style="padding:0 5px">放頭</span><span class="pace p2" style="padding:0 5px">前置</span><span class="pace p3" style="padding:0 5px">中置</span><span class="pace p4" style="padding:0 5px">後置</span></span>
+    </div>
+  </div>
+  <div class="tblwrap">
+    <div class="tbltop"><div class="tbltitle">🎯 Dutching 大細注 · 中任何一匹派彩都一樣</div>
+      <div class="sorthint">喺上表左邊「選」格剔要覆蓋嘅馬　·　總注 HK$ <input id="dtotal" class="binput" style="width:86px" type="number" value="1000" min="100" max="10000" step="100"> <span style="color:var(--muted)">($100–10000)</span></div></div>
+    <div id="dutchout"></div>
+  </div>
+  <div class="foot">
+    <b>點睇：</b>綜合勝率＝基本面勝率（跑法／檔位／距離／場地 等因子）與 市場勝率（即場賠率反推）結合。
+    EV＝綜合勝率 × 即場賠率；EV &gt; 1 代表有潛在價值。預期回報＝EV − 1。<br>
+    <b>建議注碼：</b>1/4 凱利（按「本金」計），只對 EV &gt; 1 嘅馬顯示。<b>若中派彩＝</b>注碼 × 賠率；<b>派彩減本金＝</b>中咗淨賺。<br>
+    <b>提醒：</b>綜合勝率/EV 係模型估算，<b>唔等於保證結果</b>；模型 edge 統計上未顯著。賠率「—」代表該場未開賣。
+  </div>
+</div>
+<script>
+const D = window.__DATA__ || {meetings:[]};
+const paceName={1:"放頭",2:"前置",3:"中置",4:"後置",5:"不詳"};
+const fitName={good:["佳","good"],mid:["一般","mid"],bad:["不利","bad"],unknown:["不詳","mid"]};
+const rankMap={good:3,mid:2,bad:1,unknown:0};
+const AMT_MIN=100,AMT_MAX=10000;
+let rows=[],picked=new Set(),curEl=null,mi=0,ri=0;
+function SS(k,v){try{if(v===undefined)return sessionStorage.getItem(k);sessionStorage.setItem(k,v);}catch(e){return null;}}
+function bankroll(){const v=parseFloat((document.getElementById('bankroll')||{}).value);return (isFinite(v)&&v>0)?Math.min(AMT_MAX,v):0;}
+function clampBox(el){let v=parseFloat(el.value);if(!isFinite(v)){el.value=AMT_MIN;return;}el.value=Math.min(AMT_MAX,Math.max(AMT_MIN,Math.round(v)));}
+function kfrac(r){if(r.odds==null||r.odds<=1)return 0;const e=r.pf*r.odds-1;return e<=0?0:(e/(r.odds-1))*0.25;}
+function stakeOf(r){return (r.odds==null||r.ev==null)?0:Math.round(bankroll()*kfrac(r));}
+function pct(x){return x==null?'—':(x*100).toFixed(1)+'%';}
+function drawCls(d){return d<=4?"inside":(d>=10?"outside":"");}
+function render(list){
+  window.lastList=list;
+  document.getElementById('tb').innerHTML=list.map(r=>{
+    const evN=r.ev==null,pos=!evN&&r.ev>=1.0,s=stakeOf(r);
+    const fd=fitName[r.dist]||["—","mid"],fg=fitName[r.going]||["—","mid"];
+    const od=r.odds,odS=od==null?'—':od.toFixed(1),dash='<span style="color:var(--muted)">—</span>';
+    return '<tr class="'+(pos?'ev-pos':'')+'">'
+      +'<td class="l" style="text-align:center"><input type="checkbox" class="pick" '+(picked.has(r.no)?'checked':'')+(od==null?' disabled':'')+' onchange="togglePick('+r.no+',this.checked)"></td>'
+      +'<td class="l no">'+r.no+'</td><td class="l nm">'+r.nm+'</td>'
+      +'<td><span class="draw '+(r.draw!=null?drawCls(r.draw):'')+'">'+(r.draw!=null?r.draw:'—')+'</span></td>'
+      +'<td class="l"><span class="pace p'+r.pace+'">'+paceName[r.pace]+'</span></td>'
+      +'<td class="l"><span class="fit '+fd[1]+'">'+fd[0]+'</span></td>'
+      +'<td class="l"><span class="fit '+fg[1]+'">'+fg[0]+'</span></td>'
+      +'<td>'+odS+'</td><td>'+pct(r.pm)+'</td><td>'+pct(r.pk)+'</td><td>'+pct(r.pf)+'</td>'
+      +'<td style="color:var(--accent)">'+pct(r.pl)+'</td>'
+      +'<td>'+(r.pf>0?(1/r.pf).toFixed(2):'—')+'</td>'
+      +'<td class="ev '+(pos?'pos':'neg')+'">'+(evN?'—':r.ev.toFixed(2))+'</td>'
+      +'<td class="ret '+(pos?'pos':'neg')+'">'+(evN?'—':((r.ev>=1?'+':'')+((r.ev-1)*100).toFixed(0)+'%'))+'</td>'
+      +'<td class="stake">'+(s>0?'$'+s:dash)+'</td>'
+      +'<td class="payout">'+(s>0?'$'+Math.round(s*od):dash)+'</td>'
+      +'<td class="ret '+(s>0?'pos':'')+'">'+(s>0?'+$'+Math.round(s*(od-1)):dash)+'</td></tr>';
+  }).join('');
+}
+const acc={no:r=>r.no,nm:r=>r.nm,draw:r=>r.draw==null?-1:r.draw,pace:r=>r.pace,
+  dist:r=>rankMap[r.dist],going:r=>rankMap[r.going],odds:r=>r.odds==null?1e9:r.odds,
+  pm:r=>r.pm,pk:r=>r.pk==null?-1:r.pk,pf:r=>r.pf,pl:r=>r.pl,fair:r=>r.pf>0?1/r.pf:1e9,
+  ev:r=>r.ev==null?-1:r.ev,ret:r=>r.ev==null?-1:r.ev,stake:r=>stakeOf(r),
+  payout:r=>stakeOf(r)*(r.odds||0),netwin:r=>stakeOf(r)*((r.odds||0)-1)};
+function sortCol(th){
+  const k=th.dataset.k,t=th.dataset.t;
+  let dir=(curEl===th)?(th.dataset.cur==='asc'?'desc':'asc'):th.dataset.d;
+  th.dataset.cur=dir;curEl=th;SS('sk',k);SS('sd',dir);
+  const f=acc[k];
+  const l=[...rows].sort((a,b)=>{const x=f(a),y=f(b);
+    if(t==='txt')return dir==='asc'?String(x).localeCompare(String(y),'zh-Hant'):String(y).localeCompare(String(x),'zh-Hant');
+    return dir==='asc'?x-y:y-x;});
+  render(l);
+  document.querySelectorAll('#hdr th').forEach(h=>{h.classList.remove('active');const i=h.querySelector('.ind');if(i)i.textContent='';});
+  th.classList.add('active');th.querySelector('.ind').textContent=dir==='asc'?' ▲':' ▼';
+}
+function togglePick(no,on){on?picked.add(no):picked.delete(no);renderDutch();}
+function renderDutch(){
+  const out=document.getElementById('dutchout');
+  const sel=rows.filter(r=>picked.has(r.no)&&r.odds!=null).sort((a,b)=>a.odds-b.odds);
+  if(sel.length<2){out.innerHTML='<div style="color:var(--muted);font-size:12px">喺上表剔選 2 匹或以上（有賠率）嘅馬，就會計大細注。</div>';return;}
+  const T=Math.min(AMT_MAX,Math.max(0,parseFloat(document.getElementById('dtotal').value)||0));
+  const invsum=sel.reduce((a,r)=>a+1/r.odds,0),mult=1/invsum,K=T*mult,cover=sel.reduce((a,r)=>a+r.pf,0),val=cover>invsum;
+  const rh=sel.map(r=>{const st=T*(1/r.odds)/invsum;
+    return '<div class="drow"><span>'+r.no+' '+r.nm+' <span style="color:var(--muted)">@'+r.odds.toFixed(1)+'</span></span><span><b style="color:var(--gold)">$'+Math.round(st)+'</b> <span style="color:var(--muted)">('+(T?((st/T*100).toFixed(1)):0)+'%)</span></span></div>';}).join('');
+  out.innerHTML=rh+'<div class="dsum">保證派彩（中任何一匹）：<b style="color:var(--good)">$'+Math.round(K).toLocaleString()+'</b>　淨賺 <b style="color:var(--good)">+$'+Math.round(K-T).toLocaleString()+'</b>（+'+((mult-1)*100).toFixed(1)+'%）<br>打和門檻：呢 '+sel.length+' 匹合計真實勝率需 &gt; <b>'+(invsum*100).toFixed(1)+'%</b>　｜　模型綜合勝率合計 = <b style="color:'+(val?'var(--good)':'#ff6b6b')+'">'+(cover*100).toFixed(1)+'%</b> → '+(val?'模型覺得值博 ✓':'模型覺得唔值博 ✗')+'<br><span style="color:var(--muted)">⚠️ 若 '+sel.length+' 匹全部跑唔出 → 全輸 $'+Math.round(T).toLocaleString()+'。Dutching 唔變出 edge；模型 edge 未統計顯著。</span></div>';
+}
+function lhtml(arr){return (arr&&arr.length)?arr.map(a=>{const n=a[0],rate=a[1],lift=a[2];
+  const c=lift>=1.08?'up':(lift<=0.92?'dn':'mid'),ar=lift>=1.08?' ↑':(lift<=0.92?' ↓':'');
+  return '<div class="frow"><span class="k">'+n+'</span><span class="lift '+c+'">'+(rate*100).toFixed(0)+'%'+ar+'</span></div>';}).join(''):'<div class="panel-sub">樣本不足</div>';}
+function applyRace(){
+  const mt=D.meetings[mi]||{races:[]},rc=mt.races[ri]||{horses:[],chips:[],pace:[],draw:[]};
+  rows=rc.horses||[];
+  picked=new Set(rows.filter(r=>r.ev!=null&&r.ev>=1.05&&r.odds!=null).map(r=>r.no));
+  const nval=rows.filter(r=>r.ev!=null&&r.ev>=1.05).length;
+  document.getElementById('racehdr').innerHTML='<div class="line1">'+(rc.title||'')+'<span style="color:var(--good);font-size:12px;margin-left:10px">值博 '+nval+' 匹</span></div><div class="line2">'+(rc.chips||[]).map(c=>'<span class="chip">'+c+'</span>').join('')+'</div>';
+  const dm=rc.dist?rc.dist+'M':'?M';
+  document.getElementById('factors').innerHTML=
+    '<div class="panel"><div class="panel-title">🏇 今日場地偏差</div><div class="bias">'+(rc.bias||'樣本不足')+'</div><div class="panel-sub">'+(rc.bias_sub||'')+'</div></div>'+
+    '<div class="panel"><div class="panel-title">跑法 × 入三甲率 <span class="n">（'+dm+'±100 · 基準 '+Math.round((rc.pbase||.25)*100)+'%）</span></div>'+lhtml(rc.pace)+'</div>'+
+    '<div class="panel"><div class="panel-title">檔位 × 入三甲率 <span class="n">（'+dm+'±100 · 基準 '+Math.round((rc.dbase||.25)*100)+'%）</span></div>'+lhtml(rc.draw)+'</div>';
+  let th=document.getElementById('thEV');const sk=SS('sk'),sd=SS('sd');
+  if(sk){const t2=document.querySelector('#hdr th[data-k="'+sk+'"]');if(t2){th=t2;if(sd)th.dataset.d=sd;}}
+  curEl=null;sortCol(th);renderDutch();
+}
+function fillRaces(){
+  const mt=D.meetings[mi]||{races:[]};
+  document.getElementById('selRace').innerHTML=mt.races.map((r,i)=>'<option value="'+i+'">第 '+r.no+' 場</option>').join('');
+  if(ri>=mt.races.length)ri=0;
+  document.getElementById('selRace').value=ri;
+  document.getElementById('venueLbl').textContent=mt.venue||'';
+}
+function onMeet(){mi=+document.getElementById('selMeet').value;ri=0;SS('mi',mi);SS('ri',ri);fillRaces();applyRace();}
+function onRace(){ri=+document.getElementById('selRace').value;SS('ri',ri);applyRace();}
+(function(){
+  document.getElementById('modelline').textContent='模型 '+(D.src||'')+' · 訓練 '+(D.nrace||'')+' 場 · 歷史 '+(D.nhist||'')+' 匹次';
+  document.getElementById('upd').textContent='更新 '+(D.updated||'')+' · 直連 HKJC';
+  if(!D.meetings||!D.meetings.length){document.getElementById('racehdr').innerHTML='<div class="line1">暫時冇賽馬日資料</div>';return;}
+  document.getElementById('selMeet').innerHTML=D.meetings.map((m,i)=>'<option value="'+i+'">'+m.label+'</option>').join('');
+  mi=Math.min(parseInt(SS('mi')||'0',10)||0,D.meetings.length-1);if(mi<0)mi=0;
+  document.getElementById('selMeet').value=mi;fillRaces();
+  ri=Math.min(parseInt(SS('ri')||'0',10)||0,((D.meetings[mi]||{races:[]}).races.length||1)-1);if(ri<0)ri=0;
+  document.getElementById('selRace').value=ri;
+  const bk=SS('bk');if(bk)document.getElementById('bankroll').value=bk;
+  applyRace();
+  document.getElementById('bankroll').addEventListener('input',()=>render(window.lastList||rows));
+  document.getElementById('bankroll').addEventListener('change',e=>{clampBox(e.target);SS('bk',e.target.value);render(window.lastList||rows);});
+  document.getElementById('dtotal').addEventListener('input',renderDutch);
+  document.getElementById('dtotal').addEventListener('change',e=>{clampBox(e.target);renderDutch();});
+})();
+</script>
+"""
 
 
 # ════════════════════════ 主程式 ════════════════════════
+import streamlit.components.v1 as components  # noqa: E402
 from streamlit_autorefresh import st_autorefresh  # noqa: E402
 
-st.markdown(f'<div class="hdr"><b>🐎 HKJC 賽馬日分析</b>'
-            f'<span class="badge">{APP_VERSION}</span>'
-            f'<span class="psub">識別工具 · 非保證賺錢系統（模型 edge 未統計顯著）</span></div>',
-            unsafe_allow_html=True)
+st.markdown("""<style>#MainMenu,footer,header,[data-testid="stToolbar"]{visibility:hidden;}
+.stApp{background:#0b0e14!important;} .block-container{padding:0!important;max-width:100%!important;}
+[data-testid="stElementContainer"]{margin:0!important;}</style>""", unsafe_allow_html=True)
+
+st_autorefresh(interval=60000, key="a60")
 
 bundle, hist, style, pace, model_src = load_assets()
-
 meetings, merr = list_meetings()
 if merr or not meetings:
-    st.warning(f"暫時攞唔到賽期（{merr or '今日可能冇賽事'}）。稍後再試或撳更新。")
+    st.warning(f"HKJC 連線一時唔通或今日冇賽事（{merr or '無賽期'}）。稍等下一次刷新或重載頁面。")
     st.stop()
 
-# ── 控制列 ──
-c1, c2, c3, c4, c5 = st.columns([2, 1.4, 1.2, 1.4, 1])
-labels = [f"{m['date']} · {venue_label(m['venue'])}" for m in meetings]
-idx = c1.selectbox("賽馬日", range(len(meetings)), format_func=lambda i: labels[i],
-                   index=len(meetings) - 1, key="mtg")
-sel = meetings[idx]
-bankroll = c2.number_input("單場本金 HK$", min_value=AMT_MIN, max_value=AMT_MAX, value=1000, step=100)
-refresh = c3.selectbox("刷新", ["每 60 秒", "手動"], index=0)
-if c4.button("↻ 立即更新"):
-    fetch_cards.clear(); score_day.clear()
-mode = c5.selectbox("顯示", ["全日", "單場"], index=0)
-if refresh == "每 60 秒":
-    st_autorefresh(interval=60000, key="auto60")
-
-# ── 攞 + 評分 ──
-try:
-    cards, meta, win_pool = fetch_cards(sel["date"], sel["venue"])
-except Exception as e:
-    msg = str(e)
-    if "resolve" in msg or "NameResolution" in msg or "Max retries" in msg:
-        st.warning("HKJC 連線一時唔通（間歇性 DNS），已自動重試仍未通。撳「↻ 立即更新」再試，或稍等下一次刷新。")
-    else:
-        st.error(f"攞排位/賠率失敗：{e}")
+data, derrs = build_data(meetings)
+if not data:
+    st.warning("HKJC 連線一時唔通（間歇性 DNS），已自動重試仍未攞到排位。稍等下一次刷新。"
+               + (f"　（{derrs[0]}）" if derrs else ""))
     st.stop()
-if cards.empty:
-    st.info("呢個賽馬日暫時冇排位資料。"); st.stop()
-scored = score_day(cards.to_json(), model_src + str(bundle.get("trained_at")))
 
-st.caption(f"模型：{model_src} · 訓練 {bundle.get('n_races','?')} 場 · "
-           f"資料時間 {datetime.now(HKT):%H:%M:%S} · 歷史 {len(hist):,} 匹次")
-
-# 今日偏差
-brows, blabel, bdone = today_bias(sel["date"], sel["venue"])
-
-race_nos = sorted(scored["race_no"].unique())
-if mode == "單場":
-    rsel = st.selectbox("場次", race_nos, format_func=lambda n: f"第 {n} 場")
-    race_nos = [rsel]
-
-sort_opt = st.selectbox("排序", ["EV（高→低）", "綜合勝率", "馬號", "即場賠率（低→高）"], index=0)
-sort_map = {"EV（高→低）": ("ev", False), "綜合勝率": ("p_final", False),
-            "馬號": ("horse_no", True), "即場賠率（低→高）": ("win_odds", True)}
-sort_col, sort_asc = sort_map[sort_opt]
-
-PACE_CLS = {"放頭": "p1", "前置": "p2", "中置": "p3", "後置": "p4", "後上": "p4"}
-FIT_CLS = {"佳": "fg", "一般": "fm", "不利": "fb", "不詳": "fm"}
-
-for rno in race_nos:
-    g = scored[scored["race_no"] == rno].copy()
-    m = meta.get(int(rno), {})
-    dist, going = m.get("dist"), (m.get("going") or "").upper()
-    # 逐匹 標籤
-    recs = []
-    for _, r in g.iterrows():
-        dl, gl = fitness_labels(hist, r["horse_id"], dist, going)
-        sname, spct = dominant_style(style, r["horse_id"])
-        recs.append({**r.to_dict(), "dist_fit": dl, "going_fit": gl,
-                     "pace": sname, "pace_pct": spct})
-    gg = pd.DataFrame(recs).sort_values(sort_col, ascending=sort_asc, na_position="last")
-    stakes = kelly_stakes(gg, bankroll, win_pool.get(int(rno)))
-
-    nval = int((gg["ev"] >= EV_THRESHOLD).sum()) if gg["ev"].notna().any() else 0
-    distm = f"{int(dist)}M" if dist == dist else "?M"
-    chips = "".join(f'<span class="rchip">{c}</span>' for c in [
-        m.get("cls"), f'場地：{m.get("going")}' if m.get("going") else None,
-        f'跑道 {m.get("course")}' if m.get("course") else None, f'{len(gg)} 匹出賽'] if c)
-    st.markdown(f'<div class="rhdr"><div class="l1">第 {int(rno)} 場 · {distm}'
-                f'<span class="nv">值博 {nval} 匹</span></div><div class="l2">{chips}</div></div>',
-                unsafe_allow_html=True)
-    if mode == "單場":
-        plist, pbase = pace_lift(pace, dist)
-        dlist, dbase = draw_lift(hist, dist)
-        bias_html = ((f'<div class="bias">{blabel}</div>'
-                      f'<div class="psub">已完成：{", ".join("第%d場" % n for n in bdone)}</div>')
-                     if bdone else '<div class="psub">今日尚未有已完成場次；頭幾場完成後逐場更新。</div>')
-        st.markdown(
-            '<div class="factors">'
-            f'<div class="panel"><div class="ptitle">🏇 今日場地偏差</div>{bias_html}</div>'
-            f'<div class="panel"><div class="ptitle">跑法 × 入三甲率 '
-            f'<span class="nn">（{distm}±{DIST_BAND} · 基準 {pbase*100:.0f}%）</span></div>{_lift_rows_html(plist)}</div>'
-            f'<div class="panel"><div class="ptitle">檔位 × 入三甲率 '
-            f'<span class="nn">（{distm}±{DIST_BAND} · 基準 {dbase*100:.0f}%）</span></div>{_lift_rows_html(dlist)}</div>'
-            '</div>', unsafe_allow_html=True)
-
-    head = ('<tr><th class="l">馬號</th><th class="l">馬名</th><th>檔</th><th class="l">歷史跑法</th>'
-            '<th class="l">距離</th><th class="l">場地</th><th>即場賠率</th><th>基本面</th><th>市場</th>'
-            '<th>綜合</th><th>位置</th><th>Fair</th><th>EV</th><th>預期回報</th>'
-            '<th>建議注碼</th><th>若中派彩</th><th>派彩減本金</th></tr>')
-    body = ""
-    for _, r in gg.iterrows():
-        pos = (r["ev"] == r["ev"]) and r["ev"] >= EV_THRESHOLD
-        stk = stakes.get(int(r["horse_no"]), 0)
-        pcls = PACE_CLS.get(r["pace"], "p3")
-        ppct = "" if r["pace_pct"] != r["pace_pct"] or r["pace_pct"] is None else f"{int(r['pace_pct'])}"
-        od = r["win_odds"]
-        ev_s = "—" if r["ev"] != r["ev"] else f'{r["ev"]:.2f}'
-        ret_s = "—" if r["ev"] != r["ev"] else f'{(r["ev"]-1)*100:+.0f}%'
-        def pc(x): return "—" if x != x else f"{x*100:.1f}%"
-        fair = "—" if r["p_final"] <= 0 else f'{1/r["p_final"]:.2f}'
-        pay = f'${round(stk*od)}' if stk > 0 and od == od else "—"
-        net = f'+${round(stk*(od-1))}' if stk > 0 and od == od else "—"
-        body += (f'<tr class="{"val" if pos else ""}">'
-                 f'<td class="l" style="font-weight:600">{int(r["horse_no"])}</td>'
-                 f'<td class="l">{r["horse_name"]}</td>'
-                 f'<td>{int(r["draw"]) if r["draw"]==r["draw"] else "—"}</td>'
-                 f'<td class="l"><span class="chip {pcls}">{r["pace"]}{ppct}</span></td>'
-                 f'<td class="l"><span class="{FIT_CLS.get(r["dist_fit"],"fm")}">{r["dist_fit"]}</span></td>'
-                 f'<td class="l"><span class="{FIT_CLS.get(r["going_fit"],"fm")}">{r["going_fit"]}</span></td>'
-                 f'<td>{"—" if od!=od else f"{od:.1f}"}</td>'
-                 f'<td>{pc(r["p_model"])}</td><td>{pc(r["p_public"])}</td>'
-                 f'<td>{pc(r["p_final"])}</td><td class="pl">{pc(r["p_place"])}</td><td>{fair}</td>'
-                 f'<td class="{"evpos" if pos else "evneg"}">{ev_s}</td>'
-                 f'<td class="{"evpos" if pos else "evneg"}">{ret_s}</td>'
-                 f'<td class="stake">{("$"+str(stk)) if stk>0 else "—"}</td>'
-                 f'<td>{pay}</td><td class="{"fg" if stk>0 else ""}">{net}</td></tr>')
-    st.markdown(f'<div style="overflow-x:auto"><table class="an"><thead>{head}</thead>'
-                f'<tbody>{body}</tbody></table></div>', unsafe_allow_html=True)
-
-    # Dutching（單場模式先出，避免全日太長）
-    if mode == "單場":
-        st.markdown('<div class="ptitle" style="margin-top:12px">🎯 Dutching 大細注（中任何一匹派彩一樣）</div>',
-                    unsafe_allow_html=True)
-        opts = {f'{int(r["horse_no"])} {r["horse_name"]} @{r["win_odds"]:.1f}': int(r["horse_no"])
-                for _, r in gg.iterrows() if r["win_odds"] == r["win_odds"] and r["win_odds"] > 0}
-        default = [k for k, v in opts.items() if (gg.set_index("horse_no").loc[v, "ev"] >= EV_THRESHOLD)] \
-            if gg["ev"].notna().any() else []
-        picks = st.multiselect("剔要覆蓋嘅馬", list(opts.keys()), default=default, key=f"dut{rno}")
-        T = st.number_input("總注 HK$", min_value=AMT_MIN, max_value=AMT_MAX, value=1000, step=100, key=f"dt{rno}")
-        pnos = [opts[p] for p in picks]
-        sub = gg[gg["horse_no"].isin(pnos)]
-        d = dutching(sub["win_odds"].tolist())
-        if d:
-            K = T * d["mult"]; cover = sub["p_final"].sum(); val = cover > d["breakeven"]
-            lines = "".join(
-                f'<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;'
-                f'border-bottom:1px solid rgba(34,43,58,.4)"><span>{int(r["horse_no"])} {r["horse_name"]} '
-                f'<span style="color:var(--muted)">@{r["win_odds"]:.1f}</span></span>'
-                f'<span class="stake">${round(T*p)}</span></div>'
-                for (_, r), p in zip(sub.iterrows(), d["pct"]))
-            st.markdown(lines + f'<div style="font-size:12px;margin-top:8px;line-height:1.7">'
-                        f'保證派彩 <b style="color:var(--good)">${round(K):,}</b>　淨賺 '
-                        f'<b style="color:var(--good)">+${round(K-T):,}</b>（+{(d["mult"]-1)*100:.1f}%）<br>'
-                        f'打和門檻 <b>{d["breakeven"]*100:.1f}%</b>　｜　模型綜合合計 '
-                        f'<b style="color:{"var(--good)" if val else "#ff6b6b"}">{cover*100:.1f}%</b> → '
-                        f'{"值博 ✓" if val else "唔值博 ✗"}<br>'
-                        f'<span style="color:var(--muted)">⚠️ 覆蓋馬全跑唔出 → 全輸 ${round(T):,}。'
-                        f'Dutching 唔變出 edge；模型 edge 未顯著。</span></div>', unsafe_allow_html=True)
-        else:
-            st.caption("剔 2 匹或以上先計到大細注。")
-
-# 因子摘要（今日偏差）
-with st.expander("🏇 今日場地偏差（已完成場次逐場更新）", expanded=(mode == "單場")):
-    if bdone:
-        st.caption(f"已完成：{', '.join('第%d場' % n for n in bdone)}　偏差：{blabel}")
-        if brows:
-            st.table(pd.DataFrame([{"跑法": r["style"], "樣本": r["n"],
-                                    "入三甲率": f'{r["rate"]:.1%}', "Lift": f'{r["lift"]:.2f}',
-                                    "狀態": "可參考" if r["reliable"] else "樣本不足"} for r in brows]))
-    else:
-        st.info("今日尚未有已完成場次（需 recorder 已裝 lxml 並寫到賽果）。頭幾場完成後逐場更新。")
-
-st.caption(f"HKJC 賽馬日分析 {APP_VERSION} · 獨立服務，不影響 8501 即場監察 · "
-           f"綜合勝率/EV 為模型估算，非保證結果")
+payload = {"updated": datetime.now(HKT).strftime("%H:%M:%S"), "src": model_src,
+           "nrace": bundle.get("n_races"), "nhist": len(hist), "meetings": data}
+html = TEMPLATE_HTML.replace("window.__DATA__ || {meetings:[]}",
+                             "window.__DATA__ || " + json.dumps(payload, ensure_ascii=False))
+components.html(html, height=1050, scrolling=True)
