@@ -85,7 +85,7 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V20-TEMPLATE-20261002"
+APP_VERSION = "V20.1-CHIPBAR-20261002"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -378,6 +378,36 @@ html, body, .stApp { background:var(--bg)!important; color:var(--text); font-fam
 .st-key-heat_signal_row [data-testid="column"] > div { height:100%; }
 .st-key-heat_signal_row .panel { height:100%; box-sizing:border-box; }
 .st-key-heat_signal_row [data-testid="stVerticalBlockBorderWrapper"] { height:100%; box-sizing:border-box; }
+
+/* ── 頂部控制列 chip 化（賽事/場地/場次/開跑/模式/場次下拉）── */
+.st-key-topbar [data-testid="stHorizontalBlock"] { gap:8px !important; align-items:flex-end; flex-wrap:wrap; }
+.st-key-topbar [data-testid="column"], .st-key-topbar [data-testid="stColumn"] {
+  background:var(--card); border:1px solid var(--border); border-radius:9px;
+  padding:6px 11px !important; min-width:0; }
+.st-key-topbar [data-testid="stWidgetLabel"] label,
+.st-key-topbar [data-testid="stWidgetLabel"] p,
+.st-key-topbar label {
+  font-size:9px !important; letter-spacing:.05em; text-transform:uppercase;
+  color:var(--muted) !important; margin:0 !important; padding:0 !important; }
+.st-key-topbar [data-baseweb="select"] > div {
+  background:transparent !important; border:none !important; min-height:26px !important;
+  font-size:13px; font-weight:600; }
+.st-key-topbar [data-testid="stNumberInput"] input,
+.st-key-topbar [data-testid="stTextInput"] input {
+  background:transparent !important; border:none !important; font-size:13px; font-weight:600;
+  color:var(--text) !important; padding:2px 0 !important; }
+.st-key-topbar [data-testid="stNumberInput"] [data-testid="stNumberInputStepUp"],
+.st-key-topbar [data-testid="stNumberInput"] [data-testid="stNumberInputStepDown"],
+.st-key-topbar [data-testid="stNumberInput"] button {
+  background:var(--surface) !important; border-color:var(--border) !important; }
+.st-key-topbar [role="radiogroup"] { gap:12px !important; }
+.st-key-topbar [data-testid="stCaptionContainer"],
+.st-key-topbar [data-testid="stCaptionContainer"] p { color:var(--subtext) !important; font-size:12px; }
+.st-key-topbar .stButton button {
+  background:var(--surface); border:1px solid var(--border); color:var(--text);
+  font-size:12px; padding:4px 10px; }
+/* REPLAY 場次下拉卡片化 */
+.st-key-topbar [data-testid="stSelectbox"] { margin:0 !important; }
 
 /* \u2500\u2500 \u624b\u6a5f\u512a\u5316\uff08\u7a84\u87a2\u5e55\uff09\u2500\u2500 */
 @media (max-width: 640px) {
@@ -1811,7 +1841,6 @@ table.stake tbody tr:hover td.l{background:#1c2740}
       <span class="live" id="liveBadge"><span class="dot"></span><span id="liveTxt"></span></span></div>
     <div class="upd" id="upd"></div>
   </div>
-  <div class="controls" id="controls"></div>
   <div class="racehdr"><div class="l1" id="rhead"></div><div class="l2" id="rinfo"></div></div>
   <div id="alertWrap"></div>
   <div class="pools" id="pools"></div>
@@ -1887,10 +1916,6 @@ if(rep)document.getElementById('liveBadge').classList.add('replay');
 document.getElementById('upd').textContent='資料時間 '+(D.updated||'')+(D.countdown?(' · '+D.countdown):'');
 document.getElementById('rhead').textContent=D.race.head||'';
 document.getElementById('rinfo').innerHTML=(D.race.chips||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('');
-
-// control chips (read-only；真正輸入喺上方 Streamlit)
-document.getElementById('controls').innerHTML=(D.controls||[]).map(c=>
- `<div class="ctl ${c.cls||''}"><label>${esc(c.k)}</label><span class="v">${esc(c.v)}</span></div>`).join('');
 
 // alerts
 document.getElementById('alertWrap').innerHTML=(D.alerts||[]).map(a=>
@@ -1998,16 +2023,18 @@ if '_settings_loaded_rebuilt' not in st.session_state:
     st.session_state['_settings_loaded_rebuilt'] = True
 
 st.markdown(f'<div class="hdr"><div class="hdr-title">\U0001f40e {APP_NAME}</div><span class="live">{APP_VERSION}</span></div>', unsafe_allow_html=True)
-_src_col, _sep_col, _mode_col = st.columns([2.4, 0.1, 2])
+_topbar = st.container(key='topbar')
+with _topbar:
+    _mode_col, _src_col = st.columns([1.4, 3])
 with _mode_col:
     mode = st.radio('\u6a21\u5f0f', ['\u25cf LIVE \u5373\u5834', '\U0001f501 REPLAY \u7ffb\u7747'], horizontal=True, key='mode_v19_rebuilt')
 replay_mode = 'REPLAY' in mode
 with _src_col:
     st.caption('\U0001f4e1 Recorder \u6b77\u53f2\u8a18\u9304' if replay_mode else '\U0001f4e1 \u76f4\u63a5\u9023\u7dda HKJC \u00b7 \u76ee\u6a19\u6bcf5\u79d2\u66f4\u65b0')
 
-controls_slot = st.container()
+controls_slot = _topbar.container()
 settings_slot = st.container()
-replay_picker_slot = st.empty()
+replay_picker_slot = _topbar.empty()
 with controls_slot:
     c1, c2, c3, c4, c5 = st.columns([2.4, 1, 1, 1.4, 1.4])
 if replay_mode:
