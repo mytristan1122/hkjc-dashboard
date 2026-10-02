@@ -85,7 +85,7 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V19-R2.3.3-ROWHL-20261001"
+APP_VERSION = "V20-TEMPLATE-20261002"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -1557,6 +1557,441 @@ def replay_controls(snaps, race_key, post_ts):
     st.caption(f"\u6642\u9593\u9ede\uff1a{datetime.fromtimestamp(times[idx], HKT):%Y-%m-%d %H:%M:%S}\u3000\u5171 {len(snaps)} \u500b\u8a18\u9304\u9ede")
     return idx
 
+
+# ════════════════════════════════════════════════════════════════════════
+#  TEMPLATE (approach A)：面板區改用 components.html serve 深色 template，
+#  Python 只負責把「現成數值」組成 JSON 注入。無新公式、無新抓數。
+# ════════════════════════════════════════════════════════════════════════
+import streamlit.components.v1 as components
+
+
+def _hhmmss(ts):
+    return datetime.fromtimestamp(ts, HKT).strftime('%H:%M:%S')
+
+
+def build_heat_rows(df, pla_part, qin_part, qpl_part, S, cold_odds=10.0):
+    """四池綜合熱度：每匹馬 獨/位/連/位Q 佔比% + 1分升 + tier + 皆熱。
+    邏輯同 four_pool_heat_panel 一致，只係出 data 唔出 HTML。"""
+    win = df[df['池'] == 'WIN'].copy()
+    if win.empty:
+        return []
+    inv = 1.0 / win['即場']
+    win['W%'] = inv / inv.sum() * 100.0
+    win_share = {int(k): v for k, v in zip(win['馬號'], win['W%'])}
+
+    def topN(part, n=3):
+        return set(sorted(part, key=lambda h: part[h], reverse=True)[:n]) if part else set()
+    tops = {'WIN': topN(win_share), 'PLA': topN(pla_part),
+            'QIN': topN(qin_part), 'QPL': topN(qpl_part)}
+    t1 = st.session_state.get('rise_t1', RISE_TIER1)
+    t2 = st.session_state.get('rise_t2', RISE_TIER2)
+    t3 = st.session_state.get('rise_t3', RISE_TIER3)
+    rows = []
+    for _, r in win.sort_values('即場').iterrows():
+        h = int(r['馬號'])
+        wo = float(r['即場'])
+        sh = {'WIN': r['W%'], 'PLA': pla_part.get(h, 0.0),
+              'QIN': qin_part.get(h, 0.0), 'QPL': qpl_part.get(h, 0.0)}
+        nhot = sum(h in tops[p] for p in tops)
+        susp = (wo >= cold_odds) and nhot >= 3
+        rises = {p: share_rise(S, p, h, 60) for p in ('WIN', 'PLA', 'QIN', 'QPL')}
+        mr = max(rises.values()) if rises else 0.0
+        tier = 3 if mr >= t3 else 2 if mr >= t2 else 1 if mr >= t1 else 0
+        rows.append({'no': h, 'od': round(wo, 1),
+                     'win': round(sh['WIN'], 1), 'pla': round(sh['PLA'], 1),
+                     'qin': round(sh['QIN'], 1), 'qpl': round(sh['QPL'], 1),
+                     'rise': round(mr, 1), 'tier': tier, 'nhot': nhot, 'susp': susp})
+    return rows
+
+
+def build_signal_groups(events, as_of_ts, minutes=30):
+    """30分鐘訊號：三種分組（按馬 / 按彩池 / 按時間）。events=S['signal_log']。"""
+    cutoff = as_of_ts - minutes * 60
+    evs = [e for e in events if cutoff <= e.get('ts', 0) <= as_of_ts]
+    by_time = [{'t': _hhmmss(e['ts']), 'pool': e['pool'], 'no': e['horse'],
+                'tier': e['tier'], 'rise': round(e['rise'], 1)}
+               for e in sorted(evs, key=lambda e: e['ts'], reverse=True)]
+    bh = defaultdict(list)
+    for e in evs:
+        bh[e['horse']].append(e)
+    sig_horse = []
+    for h in sorted(bh, key=lambda h: (-max(ev['tier'] for ev in bh[h]),
+                                       -max(ev['ts'] for ev in bh[h]))):
+        es = bh[h]
+        counts = {1: 0, 2: 0, 3: 0}
+        for e in es:
+            counts[e['tier']] = counts.get(e['tier'], 0) + 1
+        pools = ' '.join(sorted({e['pool'] for e in es}))
+        sig_horse.append({'no': h, 'cnt': len(es), 'max': max(e['tier'] for e in es),
+                          'counts': [counts[3], counts[2], counts[1]], 'pools': pools})
+    bp = defaultdict(list)
+    for e in evs:
+        bp[e['pool']].append(e)
+    sig_pool = [{'pool': p, 'cnt': len(bp[p]), 'max': max(e['tier'] for e in bp[p])}
+                for p in ('WIN', 'PLA', 'QIN', 'QPL') if p in bp]
+    return sig_horse, sig_pool, by_time
+
+
+def build_bars(df, S, code, as_of_ts):
+    """棒型圖：每匹馬 no/od/tot(合計=current_stake)/last(最新1分=latest_minute_gain)。"""
+    sub = df[(df['池'] == code) & (df['即場'] > 0)]
+    out = []
+    for _, r in sub.iterrows():
+        h = r['馬號']
+        tot = current_stake(S, code, h) or 0
+        last = latest_minute_gain(S, code, h, as_of_ts) or 0
+        out.append({'no': int(h), 'od': round(float(r['即場']), 1),
+                    'tot': round(tot), 'last': round(last)})
+    return out
+
+
+def build_stake_rows(df, S, code, as_of_ts):
+    """落注金額表：列 = 隔夜/當日/60/30/20/10/逐分鐘/開跑/最新1分；欄邏輯同 minute_stake_table。"""
+    sub = df[(df['池'] == code) & (df['即場'] > 0)].copy()
+    if sub.empty:
+        return {'cols': None, 'rows': None, 'note': '未有有效賠率'}
+    post_dt = S['post_time']
+    if post_dt is None:
+        return {'cols': None, 'rows': None, 'note': '需開跑時間先計倒數分鐘'}
+    post_ts = post_dt.timestamp()
+
+    def edge_ts(mb):
+        return post_ts - mb * 60
+    midnight_ts = datetime(post_dt.year, post_dt.month, post_dt.day, 0, 0, 0, tzinfo=HKT).timestamp()
+    ladder = [60, 30, 20, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+    cols = [('隔夜', True, False, None, midnight_ts),
+            ('當日', True, False, midnight_ts, edge_ts(60))]
+    for i in range(len(ladder) - 1):
+        se, ee = ladder[i], ladder[i + 1]
+        cols.append(('開跑' if ee == 0 else str(se), se >= 60, False, edge_ts(se), edge_ts(ee)))
+    latest_end = as_of_ts
+    cols.append(('最新1分', False, True, latest_end - 60, latest_end))
+
+    def bucket(h, ts0, ts1):
+        if ts1 is None:
+            return None
+        if ts0 is None:
+            se = stake_at_ts(S, code, h, ts1)
+            hist = S['stake_hist'][(code, str(h))]
+            ss = hist[0][1] if hist else None
+            return (se - ss) if se is not None and ss is not None else None
+        if ts1 == latest_end and ts0 == latest_end - 60:
+            return latest_minute_gain(S, code, h, latest_end)
+        return stake_in_bucket(S, code, h, ts0, ts1)
+
+    early = {}
+    for h in sub['馬號']:
+        vmid = stake_at_ts(S, code, h, min(midnight_ts, S['as_of_ts']))
+        v60 = stake_at_ts(S, code, h, min(edge_ts(60), S['as_of_ts']))
+        early[str(h)] = {'隔夜': vmid,
+                         '當日': (v60 - vmid) if (vmid is not None and v60 is not None
+                                                  and S['as_of_ts'] >= midnight_ts) else None}
+    rows = []
+    for _, r in sub.sort_values('即場').iterrows():
+        h = str(r['馬號'])
+        eb = early.get(h, {})
+        per = [eb.get('隔夜'), eb.get('當日')]
+        per += [bucket(h, s, e) for (_, _, _, s, e) in cols[2:]]
+        tot = current_stake(S, code, h)
+        if tot is None:
+            tot = sum(v for v in per[:-1] if v) or 0
+        rows.append({'no': int(float(h)), 'od': round(float(r['即場']), 1),
+                     'per': [None if v is None else round(v) for v in per],
+                     'total': round(tot)})
+    cols_out = [[lbl, 1 if hour else 0, 1 if sync else 0] for (lbl, hour, sync, _, _) in cols]
+    return {'cols': cols_out, 'rows': rows, 'note': None}
+
+
+def pool_minute_delta(df, S, code, as_of_ts):
+    sub = df[(df['池'] == code) & (df['即場'] > 0)]
+    tot, any_ = 0.0, False
+    for h in sub['馬號']:
+        g = latest_minute_gain(S, code, h, as_of_ts)
+        if g is not None:
+            tot += g
+            any_ = True
+    return round(tot) if any_ else None
+
+
+TEMPLATE_HTML = r'''<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+:root{--bg:#0b0e14;--surface:#141925;--card:#161b27;--border:#222b3a;--text:#e6edf3;--subtext:#9aa7b8;
+--muted:#5b6675;--accent:#50aaff;--good:#2ecb77;--warn:#ff8c3c;--hot:#c878ff;--gold:#e0a83c;--red:#ff5757;
+--mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+--sans:'Inter',system-ui,-apple-system,'PingFang HK','Microsoft JhengHei',sans-serif;color-scheme:dark;}
+*{box-sizing:border-box}html,body{margin:0}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.45;
+padding:4px 2px 24px;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1250px;margin:0 auto}
+.hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:11px 15px;
+background:var(--surface);border:1px solid var(--border);border-radius:10px}
+.hdr-l{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.hdr-title{font-size:16px;font-weight:600}
+.live{font-family:var(--mono);font-size:11px;color:var(--red);background:rgba(255,87,87,.12);
+border:1px solid rgba(255,87,87,.35);padding:3px 10px;border-radius:20px}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--red);margin-right:5px;animation:pulse 1.4s infinite}
+.live.replay{color:var(--warn);background:rgba(255,140,60,.12);border-color:rgba(255,140,60,.35)}
+.live.replay .dot{background:var(--warn);animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.upd{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.ctl{display:flex;flex-direction:column;gap:3px;background:var(--card);border:1px solid var(--border);border-radius:9px;padding:7px 11px}
+.ctl label{font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.ctl .v{font-size:13px;font-weight:600;color:var(--text);white-space:nowrap}
+.ctl.mode .v{color:var(--good)} .ctl.mode.replay .v{color:var(--warn)}
+.racehdr{margin-top:12px;padding:11px 14px;background:var(--card);border:1px solid var(--border);border-radius:10px}
+.racehdr .l1{font-size:15px;font-weight:600}
+.racehdr .l2{font-size:12px;color:var(--subtext);margin-top:4px;display:flex;gap:7px;flex-wrap:wrap}
+.chip{background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:1px 7px;font-size:11px}
+.alert{margin-top:10px;background:rgba(255,87,87,.1);border:1px solid rgba(255,87,87,.35);border-radius:8px;
+padding:7px 12px;font-size:12px;color:#ff8a8a}
+.pools{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:11px}
+.pool{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
+.pool .lbl{font-size:10px;color:var(--muted);letter-spacing:.05em}
+.pool .amt{font-family:var(--mono);font-size:19px;font-weight:600;margin-top:3px}
+.pool .sub{font-size:10px;color:var(--good);margin-top:2px;min-height:13px}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:11px}
+@media(max-width:860px){.row2{grid-template-columns:1fr}.pools{grid-template-columns:repeat(2,1fr)}}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:11px 13px;min-width:0}
+.ptitle{font-size:12px;font-weight:600;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap}
+.ptitle .psub{font-size:10px;color:var(--muted);font-weight:400}
+.hhead,.hrow{display:flex;align-items:center;gap:6px;font-size:12px;padding:3px 0}
+.hrow{border-bottom:1px solid rgba(34,43,58,.4)}
+.hhead{font-size:9px;color:var(--muted);border-bottom:1px solid var(--border);padding-bottom:5px}
+.hc-no{width:58px;font-family:var(--mono)} .hc-no .od{font-size:9px;color:var(--subtext);margin-left:3px}
+.hc-pct{flex:1;text-align:right;font-family:var(--mono);font-size:11px;color:var(--subtext)}
+.hc-rise{width:52px;text-align:right;font-family:var(--mono);font-weight:600}
+.hc-hot{width:34px;text-align:right;font-family:var(--mono);font-size:11px}
+.susp{color:var(--red);font-size:9px;margin-left:3px}
+.srow{display:flex;align-items:center;gap:8px;font-size:12px;padding:3px 0;border-bottom:1px solid rgba(34,43,58,.4)}
+.srow .t{font-family:var(--mono);color:var(--muted);width:66px;font-size:11px}
+.srow .pool-c{color:var(--subtext);width:46px;font-size:11px}
+.srow .hn{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:0 6px;font-family:var(--mono);font-size:11px}
+.srow .hname{color:var(--subtext);flex:1;font-size:11px}
+.srow .rise{font-family:var(--mono);font-weight:600;text-align:right}
+.t1{color:var(--gold)}.t2{color:var(--warn)}.t3{color:var(--hot)}
+.empty{color:var(--muted);font-size:11px;padding:8px 2px}
+.bars{display:flex;align-items:flex-end;gap:5px;height:150px;margin-top:6px;padding-top:4px;position:relative}
+.bar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:3px;min-width:0}
+.bar .col{width:70%;border-radius:3px 3px 0 0;min-height:2px}
+.bar .bn{font-family:var(--mono);font-size:9px;color:var(--muted)}
+.bar .bv{font-family:var(--mono);font-size:8px;font-weight:600;color:var(--muted)}
+.c0{background:#2a3444}.c1{background:var(--gold)}.c2{background:var(--warn)}.c3{background:var(--hot)}
+.m1{color:var(--gold)}.m2{color:var(--warn)}.m3{color:var(--hot)}
+.yax{position:absolute;left:0;top:0;bottom:18px;width:100%;pointer-events:none}
+.gl{position:absolute;left:0;right:0;border-top:1px dashed rgba(90,102,117,.25);font-size:8px;color:var(--muted);padding-left:2px}
+select.dd{background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);
+font-size:10px;font-family:var(--sans);padding:2px 6px;cursor:pointer;outline:none}
+select.dd:focus{border-color:rgba(80,170,255,.5)}
+.tchip{font-family:var(--mono);font-size:10px;background:var(--surface);border:1px solid var(--border);
+border-radius:14px;padding:2px 9px;color:var(--subtext);cursor:pointer}
+.tchip.on{color:var(--accent);border-color:rgba(80,170,255,.5);background:rgba(80,170,255,.12)}
+.scroll{overflow-x:auto;margin-top:6px}
+table.stake{border-collapse:collapse;width:100%;min-width:900px;font-size:11px}
+table.stake th{position:sticky;top:0;text-align:right;font-size:9px;color:var(--muted);padding:3px 6px;
+border-bottom:1px solid var(--border);white-space:nowrap;background:var(--card)}
+table.stake th.l{text-align:left;position:sticky;left:0;z-index:2}
+table.stake th.hour{background:rgba(30,30,44,.5)}
+table.stake th.sync{border-left:2px solid rgba(80,170,255,.5)}
+table.stake td{text-align:right;padding:3px 6px;font-family:var(--mono);white-space:nowrap;border-bottom:1px solid rgba(34,43,58,.4);color:var(--subtext)}
+table.stake td.l{text-align:left;position:sticky;left:0;background:var(--card);font-family:var(--sans);color:var(--text)}
+table.stake td.hour{color:var(--subtext)}
+table.stake td.sync{border-left:2px solid rgba(80,170,255,.5)}
+table.stake td.tot{color:var(--gold);font-weight:600}
+table.stake tbody tr:hover td{background:rgba(80,170,255,.1)}
+table.stake tbody tr:hover td.l{background:#1c2740}
+.bg1{background:rgba(255,212,59,.12)}.bg2{background:rgba(255,140,60,.14)}.bg3{background:rgba(200,120,255,.16)}
+.foot{margin-top:14px;font-size:11px;color:var(--muted);line-height:1.6}
+.foot b{color:var(--subtext)}
+</style></head><body>
+<div class="wrap">
+  <div class="hdr">
+    <div class="hdr-l"><span style="font-size:18px">&#128014;</span>
+      <span class="hdr-title" id="title"></span>
+      <span class="live" id="liveBadge"><span class="dot"></span><span id="liveTxt"></span></span></div>
+    <div class="upd" id="upd"></div>
+  </div>
+  <div class="controls" id="controls"></div>
+  <div class="racehdr"><div class="l1" id="rhead"></div><div class="l2" id="rinfo"></div></div>
+  <div id="alertWrap"></div>
+  <div class="pools" id="pools"></div>
+  <div class="row2">
+    <div class="panel">
+      <div class="ptitle">&#127919; 四池綜合熱度 <span class="psub">按獨贏賠率排 · 冷馬皆熱＝可疑</span></div>
+      <div id="heat"></div>
+    </div>
+    <div class="panel">
+      <div class="ptitle">&#128246; 30 分鐘訊號彙總
+        <select class="dd" id="sigGroup">
+          <option value="horse">按馬分組</option>
+          <option value="pool">按彩池分組</option>
+          <option value="time">按時間排列</option>
+        </select></div>
+      <div id="sig"></div>
+    </div>
+  </div>
+  <div class="row2">
+    <div class="panel">
+      <div class="ptitle">&#128202; 投注額棒型圖（獨贏）
+        <span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <span class="tchip sc on" data-chart="Win" data-sort="no">按馬號</span>
+          <span class="tchip sc" data-chart="Win" data-sort="od">按賠率</span>
+          <select class="dd" id="metricWinSel">
+            <option value="tot">按投注額（合計）</option>
+            <option value="last">近1分流入（最新1分）</option>
+          </select></span></div>
+      <div class="bars" id="barsWin"></div>
+    </div>
+    <div class="panel">
+      <div class="ptitle">&#128202; 投注額棒型圖（位置）
+        <span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <span class="tchip sc on" data-chart="Pla" data-sort="no">按馬號</span>
+          <span class="tchip sc" data-chart="Pla" data-sort="od">按賠率</span>
+          <select class="dd" id="metricPlaSel">
+            <option value="tot">按投注額（合計）</option>
+            <option value="last">近1分流入（最新1分）</option>
+          </select></span></div>
+      <div class="bars" id="barsPla"></div>
+    </div>
+  </div>
+  <div class="panel" style="margin-top:11px">
+    <div class="ptitle">&#128203; 落注金額表（獨贏 · 時間由左到右）
+      <span class="psub">隔夜 · 當日 · 60/30/20/10 每段 · 逐分鐘→開跑 · 最新1分 · 合計</span></div>
+    <div id="stakeWinWrap"></div>
+  </div>
+  <div class="panel" style="margin-top:11px">
+    <div class="ptitle">&#128203; 落注金額表（位置 · 時間由左到右）
+      <span class="psub">隔夜 · 當日 · 60/30/20/10 每段 · 逐分鐘→開跑 · 最新1分 · 合計</span></div>
+    <div id="stakePlaWrap"></div>
+  </div>
+  <div class="foot">
+    <b>提醒：</b>反推投注額係估算（捉方向用）；訊號／熱度代表幕後資金共識，<b>唔等於預測結果</b>。
+    棒色／上色門檻跟上方「敏感度」設定；最新1分＝畫面時間向前 60 秒。
+  </div>
+</div>
+<script>
+const DATA = __DATA__;
+const D = DATA;
+const tierE={1:'⚡',2:'🔥',3:'💥'};
+function fmtM(v){if(v==null)return '—';v=+v;const a=Math.abs(v),s=v<0?'-':'';
+ return a>=1e6?s+'$'+(a/1e6).toFixed(2)+'M':a>=1e3?s+'$'+Math.round(a/1e3)+'K':s+'$'+Math.round(a);}
+const A1=()=>(D.sens.a1||0)*1000,A2=()=>(D.sens.a2||0)*1000,A3=()=>(D.sens.a3||0)*1000;
+function moneyTier(v){v=+v||0;return v>=A3()?3:v>=A2()?2:v>=A1()?1:0;}
+const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+// header
+const rep = D.mode==='REPLAY';
+document.getElementById('title').textContent='HKJC '+(D.appName||'即場監察');
+document.getElementById('liveTxt').textContent = rep?'REPLAY 翻睇':'即時 · 每5秒';
+if(rep)document.getElementById('liveBadge').classList.add('replay');
+document.getElementById('upd').textContent='資料時間 '+(D.updated||'')+(D.countdown?(' · '+D.countdown):'');
+document.getElementById('rhead').textContent=D.race.head||'';
+document.getElementById('rinfo').innerHTML=(D.race.chips||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join('');
+
+// control chips (read-only；真正輸入喺上方 Streamlit)
+document.getElementById('controls').innerHTML=(D.controls||[]).map(c=>
+ `<div class="ctl ${c.cls||''}"><label>${esc(c.k)}</label><span class="v">${esc(c.v)}</span></div>`).join('');
+
+// alerts
+document.getElementById('alertWrap').innerHTML=(D.alerts||[]).map(a=>
+ `<div class="alert">⚠️ 插水警示　${a.no} 號急跌 ${a.pct}%，即場 ${a.odds}</div>`).join('');
+
+// pools
+document.getElementById('pools').innerHTML=(D.pools||[]).map(p=>
+ `<div class="pool"><div class="lbl">${esc(p.lbl)}</div><div class="amt">${fmtM(p.amt)}</div>`+
+ `<div class="sub">${p.delta!=null?('▲ 近1分 +'+fmtM(p.delta)):'&nbsp;'}</div></div>`).join('');
+
+// heat（真機 % 明細）
+(function(){
+ const h=D.heat||[];
+ if(!h.length){document.getElementById('heat').innerHTML='<div class="empty">暫無資料</div>';return;}
+ let html='<div class="hhead"><span class="hc-no">馬 賠</span>'+
+  '<span class="hc-pct">獨</span><span class="hc-pct">位</span><span class="hc-pct">連</span><span class="hc-pct">位Q</span>'+
+  '<span class="hc-rise">1分升</span><span class="hc-hot">皆熱</span></div>';
+ html+=h.map(r=>{const tc=r.tier?('t'+r.tier):'';
+  const mark=r.susp?'<span class="susp">可疑</span>':'';
+  const rise=r.rise>=0.1?('+'+r.rise.toFixed(1)+'%'):'—';
+  return `<div class="hrow"><span class="hc-no">${r.no}<span class="od">${r.od}</span>${mark}</span>`+
+   `<span class="hc-pct">${r.win.toFixed(1)}%</span><span class="hc-pct">${r.pla.toFixed(1)}%</span>`+
+   `<span class="hc-pct">${r.qin.toFixed(1)}%</span><span class="hc-pct">${r.qpl.toFixed(1)}%</span>`+
+   `<span class="hc-rise ${tc}">${r.tier?tierE[r.tier]+' ':''}${rise}</span>`+
+   `<span class="hc-hot" style="color:${r.susp?'var(--red)':'var(--muted)'}">${r.nhot}/4</span></div>`;}).join('');
+ document.getElementById('heat').innerHTML=html;
+})();
+
+// signal（三種分組）
+function drawSig(mode){
+ let h='';
+ if(mode==='pool'){
+   const sp=D.sigPool||[];
+   h=sp.length?sp.map(s=>`<div class="srow"><span class="pool-c">${s.pool}</span>`+
+     `<span class="hname">${s.cnt} 個訊號</span>`+
+     `<span class="rise t${s.max}">${tierE[s.max]} 最高</span></div>`).join(''):'';
+ }else if(mode==='time'){
+   const st=D.sigTime||[];
+   h=st.length?st.map(e=>`<div class="srow"><span class="t">${e.t}</span><span class="pool-c">${e.pool}</span>`+
+     `<span class="hn">${e.no}</span><span class="hname"></span>`+
+     `<span class="rise t${e.tier}">${tierE[e.tier]} +${e.rise.toFixed(1)}%</span></div>`).join(''):'';
+ }else{
+   const sh=D.sigHorse||[];
+   h=sh.length?sh.map(s=>{const sm=[3,2,1].map((t,i)=>s.counts[i]?tierE[t]+'×'+s.counts[i]:'').filter(Boolean).join(' ');
+     return `<div class="srow"><span class="hn">${s.no}</span>`+
+     `<span class="hname">${esc(s.pools)}</span><span class="rise t${s.max}">${sm}</span></div>`;}).join(''):'';
+ }
+ document.getElementById('sig').innerHTML=h||'<div class="empty">暫無訊號</div>';
+}
+drawSig('horse');
+document.getElementById('sigGroup').onchange=e=>drawSig(e.target.value);
+
+// bars
+function orderBars(data,sort){const d=[...data];
+ if(sort==='od')d.sort((a,b)=>a.od-b.od);else d.sort((a,b)=>a.no-b.no);return d;}
+function drawBars(id,data,metric){
+ if(!data||!data.length){document.getElementById(id).innerHTML='<div class="empty">暫無資料</div>';return;}
+ const useLast=metric==='last';
+ const mx=Math.max(1,...data.map(b=>useLast?b.last:b.tot));
+ const lab=v=>fmtM(v);
+ document.getElementById(id).innerHTML=
+  `<div class="yax"><div class="gl" style="top:0">${lab(mx)}</div><div class="gl" style="top:33%">${lab(mx*0.66)}</div><div class="gl" style="top:66%">${lab(mx*0.33)}</div></div>`+
+  data.map(b=>{const v=useLast?b.last:b.tot;const m=moneyTier(b.last);const cls=m?('m'+m):'';
+   const txt=useLast?(b.last>0?'+'+fmtM(b.last):'—'):fmtM(b.tot);
+   return `<div class="bar"><div class="bv ${cls}">${txt}</div>`+
+   `<div class="col c${m}" style="height:${Math.max(2,v/mx*120)}px"></div><div class="bn">${b.no}</div></div>`;}).join('');
+}
+let metricWin='tot',metricPla='tot',sortWin='no',sortPla='no';
+function redrawBars(){
+ drawBars('barsWin',orderBars(D.barsWin||[],sortWin),metricWin);
+ drawBars('barsPla',orderBars(D.barsPla||[],sortPla),metricPla);}
+redrawBars();
+document.getElementById('metricWinSel').onchange=e=>{metricWin=e.target.value;redrawBars();};
+document.getElementById('metricPlaSel').onchange=e=>{metricPla=e.target.value;redrawBars();};
+document.querySelectorAll('.tchip.sc').forEach(c=>c.onclick=()=>{
+ const chart=c.dataset.chart,sort=c.dataset.sort;
+ if(chart==='Win')sortWin=sort;else sortPla=sort;
+ document.querySelectorAll('.tchip.sc').forEach(x=>{if(x.dataset.chart===chart)x.classList.toggle('on',x.dataset.sort===sort);});
+ redrawBars();});
+
+// stake tables
+function drawStake(wrapId,obj){
+ const el=document.getElementById(wrapId);
+ if(!obj||!obj.cols){el.innerHTML=`<div class="empty">${esc((obj&&obj.note)||'暫無資料')}</div>`;return;}
+ let th='<tr><th class="l">馬 賠</th>';
+ obj.cols.forEach(c=>{th+=`<th class="${c[1]?'hour':''} ${c[2]?'sync':''}">${esc(c[0])}</th>`;});
+ th+='<th>合計</th></tr>';
+ const body=obj.rows.map(r=>{let tds='';
+  obj.cols.forEach((c,i)=>{const v=r.per[i];const hour=c[1],sync=c[2];
+   const t=hour?0:moneyTier(v||0);const bg=v?('bg'+t).replace('bg0',''):'';const cls=v?('m'+t).replace('m0',''):'';
+   const txt=v==null?'—':(v>0?'+'+fmtM(v):fmtM(v));
+   tds+=`<td class="${hour?'hour':''} ${sync?'sync':''} ${bg}"><span class="${cls}">${txt}</span></td>`;});
+  return `<tr><td class="l">${r.no} <span style="color:var(--muted);font-size:9px">${r.od}</span></td>${tds}<td class="tot">${fmtM(r.total)}</td></tr>`;
+ }).join('');
+ el.innerHTML=`<div class="scroll"><table class="stake"><thead>${th}</thead><tbody>${body}</tbody></table></div>`;
+}
+drawStake('stakeWinWrap',D.stakeWin);
+drawStake('stakePlaWrap',D.stakePla);
+</script></body></html>'''
+
+
 if '_settings_loaded_rebuilt' not in st.session_state:
     for key, value in load_settings().items():
         st.session_state.setdefault(key, value)
@@ -1793,26 +2228,19 @@ _current_postrace = load_postrace_analysis(race_key)
 _declared_rows = (_ri or {}).get('card_rows') or []
 _history_styles = historical_style_history(_declared_rows, race_date.isoformat(), _day_analysis)
 with upper_panels:
+    countdown = ''
     if mtp is not None:
         if mtp < 0:
             countdown = f"\u8ddd\u96e2\u958b\u8dd1 {abs(mtp)*60:.0f} \u79d2" if mtp >= -1 else f"\u8ddd\u96e2\u958b\u8dd1 {abs(mtp):.0f} \u5206\u9418"
         else:
             countdown = '\u5df2\u5230\uff0f\u8d85\u904e\u9810\u5b9a\u958b\u8dd1\u6642\u9593'
-        st.caption(countdown)
-    alerts = []
+    _alerts = []
     for _, row in df[df['\u6c60'] == 'WIN'].iterrows():
         pct, _ = recent_speed(S, ('WIN', row['\u99ac\u865f']), PLUNGE_WINDOW)
         if pct >= PLUNGE_PCT:
-            alerts.append((row['\u99ac\u865f'], pct, row['\u5373\u5834']))
-    for no, pct, odds in sorted(alerts, key=lambda a: a[1], reverse=True)[:3]:
-        st.markdown(f'<div class="alert-bar">\u26a0\ufe0f \u63d2\u6c34\u8b66\u793a\u3000{no} \u865f\u65bc {PLUNGE_WINDOW} \u79d2\u5167\u6025\u8dcc {pct:.0f}%\uff0c\u5373\u5834 {odds:.1f}</div>', unsafe_allow_html=True)
-    st.markdown(f'**{race_date} {venue_label(course)} \u00b7 \u7b2c {int(race_no)} \u5834**')
-    st.caption(f"{'REPLAY' if replay_mode else 'LIVE'} \u8cc7\u6599\u6642\u9593\uff1a{datetime.fromtimestamp(ACTIVE_NOW_TS, HKT):%Y-%m-%d %H:%M:%S}"
-               + (f"\u3000\u958b\u8dd1\u6642\u9593\uff1a{ACTIVE_POST_TIME:%H:%M}" if ACTIVE_POST_TIME else ''))
-    if _ri:
-        st.caption(' \u00b7 '.join(str(_ri.get(k)) for k in ('name', 'cls', 'dist', 'track', 'going') if _ri.get(k)))
-    else:
-        st.info('\u5462\u7b46\u820a\u8a18\u9304\u5187\u4fdd\u5b58\u76f8\u7b26\u6b77\u53f2\u99ac\u540d\uff0f\u6392\u4f4d\uff1b\u4fdd\u7559\u99ac\u865f\u53ca\u6295\u6ce8\u6b77\u53f2\uff0c\u6a21\u578b\u66ab\u4e0d\u8a08\u7b97\u3002\u65b0 Recorder \u6703\u4fdd\u5b58\u6392\u4f4d\u3002')
+            _alerts.append((row['\u99ac\u865f'], pct, row['\u5373\u5834']))
+    alert_list = [{'no': (int(no) if str(no).isdigit() else str(no)), 'pct': round(pct), 'odds': round(float(odds), 1)}
+                  for no, pct, odds in sorted(_alerts, key=lambda a: a[1], reverse=True)[:3]]
 
     with st.expander('\U0001f3c7 \u8dd1\u6cd5\uff0f\u504f\u5dee\uff08\u5df2\u5b8c\u6210\u5834\u6b21\uff09', expanded=False):
         _display_analysis = _current_postrace or _day_analysis
@@ -1850,47 +2278,56 @@ with upper_panels:
 
 
 
-    # Four pool totals and original pair matrices.
-    def total_card(label, value):
-        return f'<div class="panel" style="flex:1"><div class="panel-sub">{label}</div><b>{_fmt_money(value)}</b></div>'
-    st.markdown('<div style="display:flex;gap:8px">' + ''.join(total_card(c, pools.get(c)) for c in ('WIN', 'PLA', 'QIN', 'QPL')) + '</div>', unsafe_allow_html=True)
-    race_horses = sorted(int(h) for h in snap.get('win', {}))
-    qcol1, qcol2 = st.columns(2)
-    with qcol1:
-        combo_matrix_panel(qin_matrix, '\u9023\u8d0f QIN', race_horses)
-    with qcol2:
-        combo_matrix_panel(qpl_matrix, '\u4f4d\u7f6eQ QPL', race_horses)
-    hcol1, hcol2 = st.columns([1.3, 1])
-    with hcol1:
-        four_pool_heat_panel(df, pla_part, qin_part, qpl_part, S, pools, cold_odds=10.0)
-    with hcol2:
-        signal_summary_panel(S['signal_log'], minutes=30, as_of_ts=ACTIVE_NOW_TS)
+    # 以下面板改用 template（approach A：components.html + JSON 注入）顯示；
+    # QIN/QPL 矩陣已移除；敏感度仍由上方 Streamlit 控制（驅動 Python 計算）。
+    _t1 = st.session_state.get('rise_t1', RISE_TIER1)
+    _t2 = st.session_state.get('rise_t2', RISE_TIER2)
+    _t3 = st.session_state.get('rise_t3', RISE_TIER3)
+    _a1 = int(st.session_state.get('money_t1_k', 20))
+    _a2 = int(st.session_state.get('money_t2_k', 70))
+    _a3 = int(st.session_state.get('money_t3_k', 150))
+    _sigH, _sigP, _sigT = build_signal_groups(S['signal_log'], ACTIVE_NOW_TS, minutes=30)
+    _race_chips = [str(_ri.get(k)) for k in ('name', 'cls', 'dist', 'track', 'going') if _ri and _ri.get(k)]
+    if not _ri:
+        _race_chips = ['舊記錄無保存馬名／排位（保留馬號及投注歷史）']
+    payload = {
+        'appName': APP_NAME.replace('HKJC ', ''),
+        'updated': datetime.fromtimestamp(ACTIVE_NOW_TS, HKT).strftime('%H:%M:%S'),
+        'countdown': countdown,
+        'mode': 'REPLAY' if replay_mode else 'LIVE',
+        'race': {'head': f"{race_date} {venue_label(course)} · 第 {int(race_no)} 場",
+                 'chips': _race_chips},
+        'sens': {'p1': _t1, 'p2': _t2, 'p3': _t3, 'a1': _a1, 'a2': _a2, 'a3': _a3},
+        'controls': [
+            {'k': '賽事', 'v': str(race_date)},
+            {'k': '場地', 'v': venue_label(course)},
+            {'k': '場次', 'v': f'第 {int(race_no)} 場'},
+            {'k': '開跑時間', 'v': (ACTIVE_POST_TIME.strftime('%H:%M') if ACTIVE_POST_TIME else '—')},
+            {'k': '模式', 'v': ('REPLAY' if replay_mode else 'LIVE'),
+             'cls': ('mode replay' if replay_mode else 'mode')},
+            {'k': '資料來源', 'v': ('Recorder 歷史' if replay_mode else '直接連線')},
+            {'k': '敏感度·佔比', 'v': f'⚡{_t1:g} 🔥{_t2:g} 💥{_t3:g}%'},
+            {'k': '敏感度·金額', 'v': f'⚡${_a1}K 🔥${_a2}K 💥${_a3}K'},
+        ],
+        'alerts': alert_list,
+        'pools': [
+            {'lbl': '獨贏 WIN', 'amt': pools.get('WIN'), 'delta': pool_minute_delta(df, S, 'WIN', ACTIVE_NOW_TS)},
+            {'lbl': '位置 PLA', 'amt': pools.get('PLA'), 'delta': pool_minute_delta(df, S, 'PLA', ACTIVE_NOW_TS)},
+            {'lbl': '連贏 QIN', 'amt': pools.get('QIN'), 'delta': None},
+            {'lbl': '位置Q QPL', 'amt': pools.get('QPL'), 'delta': None},
+        ],
+        'heat': build_heat_rows(df, pla_part, qin_part, qpl_part, S, cold_odds=10.0),
+        'sigHorse': _sigH, 'sigPool': _sigP, 'sigTime': _sigT,
+        'barsWin': build_bars(df, S, 'WIN', ACTIVE_NOW_TS),
+        'barsPla': build_bars(df, S, 'PLA', ACTIVE_NOW_TS),
+        'stakeWin': build_stake_rows(df, S, 'WIN', ACTIVE_NOW_TS),
+        'stakePla': build_stake_rows(df, S, 'PLA', ACTIVE_NOW_TS),
+    }
+    _jdefault = lambda o: o.item() if hasattr(o, 'item') else (float(o) if isinstance(o, (int, float)) else str(o))
+    components.html(TEMPLATE_HTML.replace('__DATA__', json.dumps(payload, ensure_ascii=False, default=_jdefault)),
+                    height=1600, scrolling=True)
     if replay_mode:
-        st.caption('\u6b77\u53f2\u71b1\u5ea6\u8207\u8a0a\u865f\u6309\u76ee\u524d\u654f\u611f\u5ea6\u91cd\u7b97\uff1b\u6a21\u578b\u4f7f\u7528\u73fe\u6709\u6a21\u578b\u53ca\u8a72\u7b46\u6b77\u53f2\u6392\u4f4d\u91cd\u7b97\u3002')
-    bar_sort = st.radio('\u68d2\u578b\u5716\u6392\u5e8f', ['\u9806\u99ac\u865f', '\u9806\u8ce0\u7387\uff08\u71b1\u2192\u51b7\uff09'], horizontal=True, key='bar_sort')
-    sort_key = '\u8ce0\u7387' if '\u8ce0\u7387' in bar_sort else '\u99ac\u865f'
-# The placeholder is visually placed here; its controls were evaluated earlier.
-# Upper panels render in the container reserved before this timeline.
-_m1, _m2, _m3 = (st.session_state[f'money_t{i}'] for i in (1, 2, 3))
-start_clock = datetime.fromtimestamp(ACTIVE_NOW_TS - 60, HKT).strftime('%H:%M:%S')
-end_clock = datetime.fromtimestamp(ACTIVE_NOW_TS, HKT).strftime('%H:%M:%S')
-st.caption(f'\u6700\u65b01\u5206\u9418\u76ee\u6a19\u5340\u9593\uff1a{start_clock} \u2192 {end_clock}\uff1b\u9010\u99ac\u91d1\u984d\u70ba\u8ce0\u7387\u4f54\u6bd4\u4f30\u7b97\uff0c\u7f3a\u5c11\u57fa\u6e96\u6642\u986f\u793a\u7a7a\u767d\u3002')
-baselines = [sample_at(points, ACTIVE_NOW_TS - 60) for points in S['stake_hist'].values()]
-baselines = [p[0] for p in baselines if p and ACTIVE_NOW_TS - 60 - p[0] <= 45]
-if baselines:
-    lo, hi = min(baselines), max(baselines)
-    label = datetime.fromtimestamp(lo, HKT).strftime('%H:%M:%S')
-    if hi != lo:
-        label += ' \u81f3 ' + datetime.fromtimestamp(hi, HKT).strftime('%H:%M:%S')
-    st.caption(f'\u5be6\u969b\u53ef\u7528\u57fa\u6e96\u8a18\u9304\uff1a{label}\uff1b\u7d42\u9ede\uff1a{end_clock}\u3002\u820a30\u79d2\u8a18\u9304\u53ef\u80fd\u8f03\u76ee\u6a19\u5340\u9593\u9577\u3002')
-bcol1, bcol2 = st.columns(2)
-with bcol1:
-    stake_bar_chart_v(df[df['\u6c60'] == 'WIN'], '\u7368\u8d0f', win_inv, S, sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp, as_of_ts=ACTIVE_NOW_TS)
-with bcol2:
-    stake_bar_chart_v(df[df['\u6c60'] == 'PLA'], '\u4f4d\u7f6e', pla_inv, S, sort_by=sort_key, m1=_m1, m2=_m2, m3=_m3, mtp=mtp, as_of_ts=ACTIVE_NOW_TS)
-for code in ('WIN', 'PLA'):
-    minute_stake_table(df, S, win_inv, pla_inv, mtp, pool=code, m1=_m1, m2=_m2, m3=_m3, as_of_ts=ACTIVE_NOW_TS)
-st.caption(f'{APP_NAME} {APP_VERSION} \u00b7 \u6b77\u53f2\u8cc7\u6599\u7531\u7368\u7acb Recorder \u8a18\u9304')
-
+        st.caption('歷史熱度與訊號按目前敏感度重算。')
+    st.caption(f'{APP_NAME} {APP_VERSION} · 歷史資料由獨立 Recorder 記錄')
 if not replay_mode:
     st_autorefresh(interval=10000, key="live_refresh_v19_rebuilt")
