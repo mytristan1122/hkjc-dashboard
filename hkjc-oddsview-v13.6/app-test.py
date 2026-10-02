@@ -85,7 +85,7 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V21-COMPONENT-TEST-20261002"
+APP_VERSION = "V21.1-COMPONENT-TEST-20261002"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -314,7 +314,7 @@ html, body, .stApp { background:var(--bg)!important; color:var(--text); font-fam
 [data-testid="stStatusWidget"] { display:none!important; }
 .stApp > div[data-stale="true"] { opacity:1!important; filter:none!important; }
 [data-stale="true"] { opacity:1!important; }
-.block-container { padding:0.8rem 1.6rem 2rem!important; max-width:100%!important; }
+.block-container { padding:0.8rem 1.6rem 2rem!important; max-width:1290px!important; margin:0 auto!important; }
 /* 落注金額表：hover 某匹馬時成行打橫 highlight（方便對齊看時間格） */
 .staketbl tbody tr:hover td { background:rgba(80,170,255,0.16)!important; }
 .staketbl tbody tr:hover td:first-child { background:#1c2740!important; color:#dce8ff!important; }
@@ -1762,7 +1762,7 @@ TEMPLATE_HTML = r'''<!doctype html><html><head><meta charset="utf-8">
 *{box-sizing:border-box}html,body{margin:0}
 body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.45;
 padding:4px 2px 24px;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
-.wrap{max-width:1250px;margin:0 auto}
+.wrap{max-width:100%;margin:0 auto}
 .hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:11px 15px;
 background:var(--surface);border:1px solid var(--border);border-radius:10px}
 .hdr-l{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.hdr-title{font-size:16px;font-weight:600}
