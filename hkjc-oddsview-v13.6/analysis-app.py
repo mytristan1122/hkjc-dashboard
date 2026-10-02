@@ -213,7 +213,7 @@ def score_day(cards_json, _bundle_id):
     from model import public_probabilities
     from exotics import place_probs
     from staking import expected_value, breakeven_odds
-    bundle, hist, _, _ = load_assets()
+    bundle, hist, _, _, _ = load_assets()
     card = pd.read_json(io.StringIO(cards_json))
     card["race_date"] = pd.to_datetime(card["race_date"])
     rids = set(card["race_id"].unique())
