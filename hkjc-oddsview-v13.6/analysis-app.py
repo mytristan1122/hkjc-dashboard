@@ -29,6 +29,10 @@ STYLE_CSV_CANDIDATES = [
     MODEL_DIR / "running_style_analysis" / "horse_running_style_summary.csv",
     MODEL_DIR / "horse_running_style_summary.csv",
 ]
+PACE_CSV_CANDIDATES = [
+    APP_DIR / "pace_per_start.csv",
+    MODEL_DIR / "pace_per_start.csv",
+]
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
@@ -57,11 +61,32 @@ def _f(x):
     except (TypeError, ValueError): return np.nan
 
 
+# 間歇性 DNS（info.cld.hkjc.com 時好時壞）→ 用 Session + 連線重試捱過。
+_SESSION = requests.Session()
+try:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    _SESSION.mount("https://", HTTPAdapter(max_retries=Retry(
+        total=5, connect=5, read=3, backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504])))
+except Exception:
+    pass
+
+
 def _gql(variables):
-    r = requests.post(API, headers=HEADERS, json={
-        "operationName": "raceMeetings", "variables": variables, "query": TURNOVER_QUERY}, timeout=25)
-    r.raise_for_status()
-    return r.json()
+    last = None
+    for _ in range(3):   # 額外手動重試（兜底 DNS NameResolutionError）
+        try:
+            r = _SESSION.post(API, headers=HEADERS, json={
+                "operationName": "raceMeetings", "variables": variables,
+                "query": TURNOVER_QUERY}, timeout=25)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            last = e
+            import time as _t
+            _t.sleep(1.5)
+    raise last
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -159,7 +184,13 @@ def load_assets():
     for p in STYLE_CSV_CANDIDATES:
         if Path(p).exists():
             style = pd.read_csv(p); break
-    return bundle, hist, style, src
+    pace = pd.DataFrame()
+    for p in PACE_CSV_CANDIDATES:
+        if Path(p).exists():
+            pace = pd.read_csv(p)
+            pace["finish_position"] = pd.to_numeric(pace["finish_position"], errors="coerce")
+            break
+    return bundle, hist, style, pace, src
 
 
 # ── 評分引擎 ──
@@ -289,26 +320,112 @@ def today_bias(date_str, venue):
     return rows, bias, sorted([x for x in done if x])
 
 
+def draw_lift(hist, dist, band=DIST_BAND):
+    """檔位 × 入三甲率（此距離帶，全季歷史）。回傳 ([(label,rate,lift)], base)。"""
+    try:
+        d = float(dist)
+    except (TypeError, ValueError):
+        return [], 0.25
+    h = hist[(hist["distance"] - d).abs() <= band].copy()
+    if h.empty:
+        return [], 0.25
+    h["t3"] = (h["finishing_position"] <= 3).astype(int)
+    base = h["t3"].mean() or 0.25
+    out = []
+    for name, lo, hi in [("內檔 1–4", 1, 4), ("中檔 5–9", 5, 9), ("外檔 10+", 10, 99)]:
+        sub = h[(h["draw"] >= lo) & (h["draw"] <= hi)]
+        if len(sub) >= 10:
+            r = sub["t3"].mean(); out.append((name, r, r / base if base else 1))
+    return out, base
+
+
+def pace_lift(pace, dist, band=DIST_BAND):
+    """跑法 × 入三甲率（此距離帶，全季歷史）。"""
+    if pace.empty:
+        return [], 0.25
+    try:
+        d = float(dist)
+    except (TypeError, ValueError):
+        return [], 0.25
+    t = pace[(pace["distance"] - d).abs() <= band].copy()
+    t = t.dropna(subset=["finish_position"])
+    if t.empty:
+        return [], 0.25
+    t["t3"] = (t["finish_position"] <= 3).astype(int)
+    base = t["t3"].mean() or 0.25
+    out = []
+    for s in ["放頭", "前置", "中置", "後置"]:
+        sub = t[t["run_style"] == s]
+        if len(sub) >= 10:
+            r = sub["t3"].mean(); out.append((s, r, r / base if base else 1))
+    return out, base
+
+
+def _lift_rows_html(rows):
+    h = ""
+    for name, rate, lift in rows:
+        cls = "lup" if lift >= 1.08 else ("ldn" if lift <= 0.92 else "lmid")
+        arr = " ↑" if lift >= 1.08 else (" ↓" if lift <= 0.92 else "")
+        h += (f'<div class="frow"><span class="fk">{name}</span>'
+              f'<span class="{cls}">{rate*100:.0f}%{arr}</span></div>')
+    return h or '<div class="psub">樣本不足</div>'
+
+
 # ════════════════════════ CSS ════════════════════════
 st.markdown("""<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
 :root{--bg:#0b0e14;--surface:#141925;--card:#161b27;--border:#222b3a;--text:#e6edf3;
---subtext:#9aa7b8;--muted:#5b6675;--accent:#50aaff;--good:#2ecb77;--gold:#e0a83c;}
-html,body,.stApp{background:var(--bg)!important;color:var(--text);font-family:'Inter',system-ui,sans-serif;}
-#MainMenu,footer,header{visibility:hidden;}
-.block-container{padding:0.7rem 1.4rem 2rem!important;max-width:100%!important;}
+--subtext:#9aa7b8;--muted:#5b6675;--accent:#50aaff;--good:#2ecb77;--gold:#e0a83c;
+--mono:'JetBrains Mono',ui-monospace,monospace;}
+html,body,.stApp{background:var(--bg)!important;color:var(--text);
+font-family:'Inter',system-ui,-apple-system,'PingFang HK','Microsoft JhengHei',sans-serif;}
+#MainMenu,footer,header,[data-testid="stToolbar"]{visibility:hidden;}
+.block-container{padding:0.6rem 1.3rem 2rem!important;max-width:100%!important;}
+[data-testid="stVerticalBlock"]{gap:0.45rem!important;}
+[data-testid="stElementContainer"]{margin:0!important;}
+/* ── Streamlit 原生 widget 壓深壓細（貼近 template chip）── */
+[data-testid="stWidgetLabel"] p,[data-testid="stWidgetLabel"] label{font-size:9px!important;
+letter-spacing:.05em;text-transform:uppercase;color:var(--muted)!important;margin-bottom:2px!important;font-weight:600;}
+div[data-baseweb="select"]>div{background:var(--card)!important;border-color:var(--border)!important;
+min-height:32px!important;font-size:13px!important;color:var(--text)!important;border-radius:8px!important;}
+div[data-baseweb="select"] *{color:var(--text)!important;}
+[data-testid="stNumberInput"] input,[data-testid="stTextInput"] input{background:var(--card)!important;
+color:var(--text)!important;font-family:var(--mono)!important;font-weight:600;font-size:13px!important;}
+[data-testid="stNumberInput"] div[data-baseweb="input"],
+[data-testid="stNumberInputContainer"]{background:var(--card)!important;border-color:var(--border)!important;border-radius:8px!important;}
+[data-testid="stNumberInput"] button{background:var(--surface)!important;border-color:var(--border)!important;}
+.stButton>button{background:var(--good)!important;color:#06220f!important;border:0!important;
+border-radius:8px!important;font-weight:600!important;font-size:12px!important;padding:6px 12px!important;margin-top:16px!important;}
+div[data-baseweb="popover"] *,[data-baseweb="menu"] *{background:var(--card)!important;color:var(--text)!important;}
+[data-baseweb="tag"]{background:rgba(80,170,255,.18)!important;}
+/* ── header ── */
 .hdr{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 15px;background:var(--surface);
-border:1px solid var(--border);border-radius:10px;margin-bottom:10px;}
-.hdr b{font-size:16px;} .badge{font-family:monospace;font-size:11px;color:var(--accent);
+border:1px solid var(--border);border-radius:10px;}
+.hdr b{font-size:16px;} .badge{font-family:var(--mono);font-size:11px;color:var(--accent);
 background:rgba(80,170,255,.12);border:1px solid rgba(80,170,255,.35);padding:3px 9px;border-radius:20px;}
-.panel{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:11px 13px;margin-top:10px;}
-.ptitle{font-size:13px;font-weight:600;margin-bottom:6px;}
-.psub{font-size:11px;color:var(--muted);}
-table.an{border-collapse:collapse;width:100%;font-size:12px;}
+/* ── 賽事資料 header ── */
+.rhdr{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin-top:10px;}
+.rhdr .l1{font-size:15px;font-weight:600;}
+.rhdr .l1 .nv{color:var(--good);font-size:12px;margin-left:8px;}
+.rhdr .l2{margin-top:5px;display:flex;gap:7px;flex-wrap:wrap;}
+.rchip{background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:1px 7px;font-size:11px;color:var(--subtext);}
+/* ── 因子三格 ── */
+.factors{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:9px;margin-top:9px;}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:11px 13px;}
+.ptitle{font-size:12px;font-weight:600;margin-bottom:7px;}
+.psub{font-size:10px;color:var(--muted);margin-top:5px;}
+.bias{font-size:14px;font-weight:600;color:var(--gold);}
+.frow{display:flex;justify-content:space-between;font-size:12px;padding:2px 0;}
+.fk{color:var(--subtext);} .lup{color:var(--good);font-weight:600;font-family:var(--mono);}
+.ldn{color:#ff6b6b;font-weight:600;font-family:var(--mono);} .lmid{color:var(--subtext);font-family:var(--mono);}
+.nn{font-family:var(--mono);font-size:10px;color:var(--muted);font-weight:400;}
+/* ── 分析表 ── */
+table.an{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:tabular-nums;}
 table.an th{position:sticky;top:0;background:var(--card);text-align:right;font-size:9px;color:var(--muted);
-padding:5px 7px;border-bottom:1px solid var(--border);white-space:nowrap;}
+padding:6px 7px;border-bottom:1px solid var(--border);white-space:nowrap;}
 table.an th.l,table.an td.l{text-align:left;}
-table.an td{text-align:right;padding:5px 7px;border-bottom:1px solid rgba(34,43,58,.5);
-font-family:monospace;white-space:nowrap;}
+table.an td{text-align:right;padding:6px 7px;border-bottom:1px solid rgba(34,43,58,.5);
+font-family:var(--mono);white-space:nowrap;}
 table.an tbody tr:hover td{background:rgba(80,170,255,.12);}
 table.an tr.val td{background:rgba(46,203,119,.08);}
 table.an tr.val:hover td{background:rgba(46,203,119,.15);}
@@ -317,7 +434,7 @@ table.an tr.val:hover td{background:rgba(46,203,119,.15);}
 .chip{border-radius:5px;padding:1px 6px;font-family:'Inter',sans-serif;font-weight:600;}
 .fg{color:var(--good);} .fm{color:var(--subtext);} .fb{color:#ff6b6b;}
 .evpos{color:var(--good);font-weight:700;} .evneg{color:var(--muted);}
-.stake{color:var(--gold);font-weight:600;}
+.stake{color:var(--gold);font-weight:600;} .pl{color:var(--accent);}
 </style>""", unsafe_allow_html=True)
 
 
@@ -329,7 +446,7 @@ st.markdown(f'<div class="hdr"><b>🐎 HKJC 賽馬日分析</b>'
             f'<span class="psub">識別工具 · 非保證賺錢系統（模型 edge 未統計顯著）</span></div>',
             unsafe_allow_html=True)
 
-bundle, hist, style, model_src = load_assets()
+bundle, hist, style, pace, model_src = load_assets()
 
 meetings, merr = list_meetings()
 if merr or not meetings:
@@ -354,7 +471,12 @@ if refresh == "每 60 秒":
 try:
     cards, meta, win_pool = fetch_cards(sel["date"], sel["venue"])
 except Exception as e:
-    st.error(f"攞排位/賠率失敗：{e}"); st.stop()
+    msg = str(e)
+    if "resolve" in msg or "NameResolution" in msg or "Max retries" in msg:
+        st.warning("HKJC 連線一時唔通（間歇性 DNS），已自動重試仍未通。撳「↻ 立即更新」再試，或稍等下一次刷新。")
+    else:
+        st.error(f"攞排位/賠率失敗：{e}")
+    st.stop()
 if cards.empty:
     st.info("呢個賽馬日暫時冇排位資料。"); st.stop()
 scored = score_day(cards.to_json(), model_src + str(bundle.get("trained_at")))
@@ -393,10 +515,27 @@ for rno in race_nos:
     stakes = kelly_stakes(gg, bankroll, win_pool.get(int(rno)))
 
     nval = int((gg["ev"] >= EV_THRESHOLD).sum()) if gg["ev"].notna().any() else 0
-    st.markdown(f'<div class="panel"><div class="ptitle">第 {int(rno)} 場 · '
-                f'{m.get("cls") or ""} · {int(dist) if dist==dist else "?"}M · {m.get("going") or ""} · '
-                f'跑道 {m.get("course") or ""} · {len(gg)} 匹　'
-                f'<span style="color:var(--good)">值博 {nval} 匹</span></div>', unsafe_allow_html=True)
+    distm = f"{int(dist)}M" if dist == dist else "?M"
+    chips = "".join(f'<span class="rchip">{c}</span>' for c in [
+        m.get("cls"), f'場地：{m.get("going")}' if m.get("going") else None,
+        f'跑道 {m.get("course")}' if m.get("course") else None, f'{len(gg)} 匹出賽'] if c)
+    st.markdown(f'<div class="rhdr"><div class="l1">第 {int(rno)} 場 · {distm}'
+                f'<span class="nv">值博 {nval} 匹</span></div><div class="l2">{chips}</div></div>',
+                unsafe_allow_html=True)
+    if mode == "單場":
+        plist, pbase = pace_lift(pace, dist)
+        dlist, dbase = draw_lift(hist, dist)
+        bias_html = ((f'<div class="bias">{blabel}</div>'
+                      f'<div class="psub">已完成：{", ".join("第%d場" % n for n in bdone)}</div>')
+                     if bdone else '<div class="psub">今日尚未有已完成場次；頭幾場完成後逐場更新。</div>')
+        st.markdown(
+            '<div class="factors">'
+            f'<div class="panel"><div class="ptitle">🏇 今日場地偏差</div>{bias_html}</div>'
+            f'<div class="panel"><div class="ptitle">跑法 × 入三甲率 '
+            f'<span class="nn">（{distm}±{DIST_BAND} · 基準 {pbase*100:.0f}%）</span></div>{_lift_rows_html(plist)}</div>'
+            f'<div class="panel"><div class="ptitle">檔位 × 入三甲率 '
+            f'<span class="nn">（{distm}±{DIST_BAND} · 基準 {dbase*100:.0f}%）</span></div>{_lift_rows_html(dlist)}</div>'
+            '</div>', unsafe_allow_html=True)
 
     head = ('<tr><th class="l">馬號</th><th class="l">馬名</th><th>檔</th><th class="l">歷史跑法</th>'
             '<th class="l">距離</th><th class="l">場地</th><th>即場賠率</th><th>基本面</th><th>市場</th>'
@@ -424,7 +563,7 @@ for rno in race_nos:
                  f'<td class="l"><span class="{FIT_CLS.get(r["going_fit"],"fm")}">{r["going_fit"]}</span></td>'
                  f'<td>{"—" if od!=od else f"{od:.1f}"}</td>'
                  f'<td>{pc(r["p_model"])}</td><td>{pc(r["p_public"])}</td>'
-                 f'<td>{pc(r["p_final"])}</td><td>{pc(r["p_place"])}</td><td>{fair}</td>'
+                 f'<td>{pc(r["p_final"])}</td><td class="pl">{pc(r["p_place"])}</td><td>{fair}</td>'
                  f'<td class="{"evpos" if pos else "evneg"}">{ev_s}</td>'
                  f'<td class="{"evpos" if pos else "evneg"}">{ret_s}</td>'
                  f'<td class="stake">{("$"+str(stk)) if stk>0 else "—"}</td>'
