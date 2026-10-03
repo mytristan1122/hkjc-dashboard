@@ -85,7 +85,7 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V21.1-COMPONENT-TEST-20261002"
+APP_VERSION = "V21.3-COMPONENT-TEST-20261003"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -1989,16 +1989,23 @@ function drawBars(id,data,metric){
    return `<div class="bar"><div class="bv ${cls}">${txt}</div>`+
    `<div class="col c${m}" style="height:${Math.max(2,v/mx*120)}px"></div><div class="bn">${b.no}</div></div>`;}).join('');
 }
-let metricWin='tot',metricPla='tot',sortWin='no',sortPla='no';
+// 棒型圖排序/metric 選擇：記低喺 localStorage，轉場次/每5秒更新都唔會 reset
+const LS=(k,v)=>{try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v);}catch(e){return null;}};
+let metricWin=LS('barMW')||'tot',metricPla=LS('barMP')||'tot',sortWin=LS('barSW')||'no',sortPla=LS('barSP')||'no';
 function redrawBars(){
  drawBars('barsWin',orderBars(D.barsWin||[],sortWin),metricWin);
  drawBars('barsPla',orderBars(D.barsPla||[],sortPla),metricPla);}
+// 還原已儲存選擇到控制件
+(function(){const a=document.getElementById('metricWinSel');if(a)a.value=metricWin;
+ const b=document.getElementById('metricPlaSel');if(b)b.value=metricPla;
+ document.querySelectorAll('.tchip.sc').forEach(x=>{const want=(x.dataset.chart==='Win')?sortWin:sortPla;
+  x.classList.toggle('on',x.dataset.sort===want);});})();
 redrawBars();
-document.getElementById('metricWinSel').onchange=e=>{metricWin=e.target.value;redrawBars();};
-document.getElementById('metricPlaSel').onchange=e=>{metricPla=e.target.value;redrawBars();};
+document.getElementById('metricWinSel').onchange=e=>{metricWin=e.target.value;LS('barMW',metricWin);redrawBars();};
+document.getElementById('metricPlaSel').onchange=e=>{metricPla=e.target.value;LS('barMP',metricPla);redrawBars();};
 document.querySelectorAll('.tchip.sc').forEach(c=>c.onclick=()=>{
  const chart=c.dataset.chart,sort=c.dataset.sort;
- if(chart==='Win')sortWin=sort;else sortPla=sort;
+ if(chart==='Win'){sortWin=sort;LS('barSW',sort);}else{sortPla=sort;LS('barSP',sort);}
  document.querySelectorAll('.tchip.sc').forEach(x=>{if(x.dataset.chart===chart)x.classList.toggle('on',x.dataset.sort===sort);});
  redrawBars();});
 
@@ -2020,6 +2027,12 @@ function drawStake(wrapId,obj){
 }
 drawStake('stakeWinWrap',D.stakeWin);
 drawStake('stakePlaWrap',D.stakePla);
+// ── 自動高度：量度內容高度通知外層 iframe 放大（手機先唔會塞唔晒）──
+function reportH(){try{var h=Math.max(document.body.scrollHeight,document.documentElement.scrollHeight,document.body.offsetHeight)+6;
+ window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setFrameHeight',height:h},'*');}catch(e){}}
+reportH();setTimeout(reportH,150);setTimeout(reportH,600);setTimeout(reportH,1500);
+window.addEventListener('resize',reportH);
+try{new ResizeObserver(reportH).observe(document.body);}catch(e){}
 </script></body></html>'''
 
 
