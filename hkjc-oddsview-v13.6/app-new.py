@@ -85,7 +85,7 @@ def historical_style_history(card_rows, before_date, same_day_analysis=None):
         result[str(horse)] = result[str(horse)][-12:]
     return dict(result)
 
-APP_VERSION = "V20.1-CHIPBAR-20261002"
+APP_VERSION = "V20.4-BARPREF-20261003"
 APP_NAME = "HKJC \u5373\u6642\u8ce0\u7387\u76e3\u5bdf"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide",
@@ -314,7 +314,7 @@ html, body, .stApp { background:var(--bg)!important; color:var(--text); font-fam
 [data-testid="stStatusWidget"] { display:none!important; }
 .stApp > div[data-stale="true"] { opacity:1!important; filter:none!important; }
 [data-stale="true"] { opacity:1!important; }
-.block-container { padding:0.8rem 1.6rem 2rem!important; max-width:100%!important; }
+.block-container { padding:0.8rem 1.6rem 2rem!important; max-width:1290px!important; margin:0 auto!important; }
 /* 落注金額表：hover 某匹馬時成行打橫 highlight（方便對齊看時間格） */
 .staketbl tbody tr:hover td { background:rgba(80,170,255,0.16)!important; }
 .staketbl tbody tr:hover td:first-child { background:#1c2740!important; color:#dce8ff!important; }
@@ -408,6 +408,12 @@ html, body, .stApp { background:var(--bg)!important; color:var(--text); font-fam
   font-size:12px; padding:4px 10px; }
 /* REPLAY 場次下拉卡片化 */
 .st-key-topbar [data-testid="stSelectbox"] { margin:0 !important; }
+/* 收緊：卡細啲、行距細啲 */
+.st-key-topbar [data-testid="column"], .st-key-topbar [data-testid="stColumn"] { padding:5px 10px !important; }
+.st-key-topbar [data-testid="stVerticalBlock"] { gap:6px !important; }
+.st-key-topbar [data-testid="stElementContainer"], .st-key-topbar [data-testid="stWidgetLabel"] { margin:0 !important; }
+.st-key-topbar [data-testid="stRadio"] > div { gap:0 !important; }
+.st-key-topbar p { margin:0 !important; }
 
 /* \u2500\u2500 \u624b\u6a5f\u512a\u5316\uff08\u7a84\u87a2\u5e55\uff09\u2500\u2500 */
 @media (max-width: 640px) {
@@ -1753,7 +1759,7 @@ TEMPLATE_HTML = r'''<!doctype html><html><head><meta charset="utf-8">
 *{box-sizing:border-box}html,body{margin:0}
 body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.45;
 padding:4px 2px 24px;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
-.wrap{max-width:1250px;margin:0 auto}
+.wrap{max-width:100%;margin:0 auto}
 .hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:11px 15px;
 background:var(--surface);border:1px solid var(--border);border-radius:10px}
 .hdr-l{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.hdr-title{font-size:16px;font-weight:600}
@@ -1835,10 +1841,8 @@ table.stake tbody tr:hover td.l{background:#1c2740}
 .foot b{color:var(--subtext)}
 </style></head><body>
 <div class="wrap">
-  <div class="hdr">
-    <div class="hdr-l"><span style="font-size:18px">&#128014;</span>
-      <span class="hdr-title" id="title"></span>
-      <span class="live" id="liveBadge"><span class="dot"></span><span id="liveTxt"></span></span></div>
+  <div class="hdr" style="padding:7px 13px">
+    <div class="hdr-l"><span class="live" id="liveBadge"><span class="dot"></span><span id="liveTxt"></span></span></div>
     <div class="upd" id="upd"></div>
   </div>
   <div class="racehdr"><div class="l1" id="rhead"></div><div class="l2" id="rinfo"></div></div>
@@ -1910,7 +1914,6 @@ const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'
 
 // header
 const rep = D.mode==='REPLAY';
-document.getElementById('title').textContent='HKJC '+(D.appName||'即場監察');
 document.getElementById('liveTxt').textContent = rep?'REPLAY 翻睇':'即時 · 每5秒';
 if(rep)document.getElementById('liveBadge').classList.add('replay');
 document.getElementById('upd').textContent='資料時間 '+(D.updated||'')+(D.countdown?(' · '+D.countdown):'');
@@ -1983,16 +1986,23 @@ function drawBars(id,data,metric){
    return `<div class="bar"><div class="bv ${cls}">${txt}</div>`+
    `<div class="col c${m}" style="height:${Math.max(2,v/mx*120)}px"></div><div class="bn">${b.no}</div></div>`;}).join('');
 }
-let metricWin='tot',metricPla='tot',sortWin='no',sortPla='no';
+// 棒型圖排序/metric 選擇：記低喺 localStorage，轉場次/每5秒更新都唔會 reset
+const LS=(k,v)=>{try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v);}catch(e){return null;}};
+let metricWin=LS('barMW')||'tot',metricPla=LS('barMP')||'tot',sortWin=LS('barSW')||'no',sortPla=LS('barSP')||'no';
 function redrawBars(){
  drawBars('barsWin',orderBars(D.barsWin||[],sortWin),metricWin);
  drawBars('barsPla',orderBars(D.barsPla||[],sortPla),metricPla);}
+// 還原已儲存選擇到控制件
+(function(){const a=document.getElementById('metricWinSel');if(a)a.value=metricWin;
+ const b=document.getElementById('metricPlaSel');if(b)b.value=metricPla;
+ document.querySelectorAll('.tchip.sc').forEach(x=>{const want=(x.dataset.chart==='Win')?sortWin:sortPla;
+  x.classList.toggle('on',x.dataset.sort===want);});})();
 redrawBars();
-document.getElementById('metricWinSel').onchange=e=>{metricWin=e.target.value;redrawBars();};
-document.getElementById('metricPlaSel').onchange=e=>{metricPla=e.target.value;redrawBars();};
+document.getElementById('metricWinSel').onchange=e=>{metricWin=e.target.value;LS('barMW',metricWin);redrawBars();};
+document.getElementById('metricPlaSel').onchange=e=>{metricPla=e.target.value;LS('barMP',metricPla);redrawBars();};
 document.querySelectorAll('.tchip.sc').forEach(c=>c.onclick=()=>{
  const chart=c.dataset.chart,sort=c.dataset.sort;
- if(chart==='Win')sortWin=sort;else sortPla=sort;
+ if(chart==='Win'){sortWin=sort;LS('barSW',sort);}else{sortPla=sort;LS('barSP',sort);}
  document.querySelectorAll('.tchip.sc').forEach(x=>{if(x.dataset.chart===chart)x.classList.toggle('on',x.dataset.sort===sort);});
  redrawBars();});
 
@@ -2014,6 +2024,12 @@ function drawStake(wrapId,obj){
 }
 drawStake('stakeWinWrap',D.stakeWin);
 drawStake('stakePlaWrap',D.stakePla);
+// ── 自動高度：量度內容高度通知外層 iframe 放大（手機先唔會塞唔晒）──
+function reportH(){try{var h=Math.max(document.body.scrollHeight,document.documentElement.scrollHeight,document.body.offsetHeight)+6;
+ window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setFrameHeight',height:h},'*');}catch(e){}}
+reportH();setTimeout(reportH,150);setTimeout(reportH,600);setTimeout(reportH,1500);
+window.addEventListener('resize',reportH);
+try{new ResizeObserver(reportH).observe(document.body);}catch(e){}
 </script></body></html>'''
 
 
