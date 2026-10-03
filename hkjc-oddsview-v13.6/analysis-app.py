@@ -16,7 +16,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "8502-V1.1-LOCAL-20261003"
+APP_VERSION = "8502-V1.2-ODDS-20261003"
 HKT = timezone(timedelta(hours=8))
 
 # ── 路徑：hkjc_quant（模型+數據+模組）──
@@ -54,6 +54,8 @@ HEADERS = {"Content-Type": "application/json", "Accept": "application/json",
            "User-Agent": "Mozilla/5.0"}
 TURNOVER_QUERY = 'fragment raceFragment on Race {\n  id\n  no\n  status\n  raceName_en\n  raceName_ch\n  postTime\n  country_en\n  country_ch\n  distance\n  wageringFieldSize\n  go_en\n  go_ch\n  ratingType\n  raceTrack {\n    description_en\n    description_ch\n  }\n  raceCourse {\n    description_en\n    description_ch\n    displayCode\n  }\n  claCode\n  raceClass_en\n  raceClass_ch\n  judgeSigns {\n    value_en\n  }\n}\n\nfragment racingBlockFragment on RaceMeeting {\n  jpEsts: pmPools(\n    oddsTypes: [WIN, PLA, TCE, TRI, FF, QTT, DT, TT, SixUP]\n    filters: ["jackpot", "estimatedDividend"]\n  ) {\n    leg {\n      number\n      races\n    }\n    oddsType\n    jackpot\n    estimatedDividend\n    mergedPoolId\n  }\n  poolInvs: pmPools(\n    oddsTypes: [WIN, PLA, QIN, QPL, CWA, CWB, CWC, IWN, FCT, TCE, TRI, FF, QTT, DBL, TBL, DT, TT, SixUP]\n  ) {\n    id\n    leg {\n      races\n    }\n  }\n  penetrometerReadings(filters: ["first"]) {\n    reading\n    readingTime\n  }\n  hammerReadings(filters: ["first"]) {\n    reading\n    readingTime\n  }\n  changeHistories(filters: ["top3"]) {\n    type\n    time\n    raceNo\n    runnerNo\n    horseName_ch\n    horseName_en\n    jockeyName_ch\n    jockeyName_en\n    scratchHorseName_ch\n    scratchHorseName_en\n    handicapWeight\n    scrResvIndicator\n  }\n}\n\nquery raceMeetings($date: String, $venueCode: String) {\n  timeOffset {\n    rc\n  }\n  activeMeetings: raceMeetings {\n    id\n    venueCode\n    date\n    status\n    races {\n      no\n      postTime\n      status\n      wageringFieldSize\n    }\n    poolInvs: pmPools(\n      oddsTypes: [WIN, PLA, QIN, QPL, CWA, CWB, CWC, IWN, FCT, TCE, TRI, FF, QTT, DBL, TBL, DT, TT, SixUP]\n    ) {\n      status\n    }\n  }\n  raceMeetings(date: $date, venueCode: $venueCode) {\n    id\n    status\n    venueCode\n    date\n    totalNumberOfRace\n    currentNumberOfRace\n    dateOfWeek\n    meetingType\n    totalInvestment\n    country {\n      code\n      namech\n      nameen\n      seq\n    }\n    races {\n      ...raceFragment\n      runners {\n        id\n        no\n        standbyNo\n        status\n        name_ch\n        name_en\n        horse {\n          id\n          code\n        }\n        color\n        barrierDrawNumber\n        handicapWeight\n        currentWeight\n        currentRating\n        internationalRating\n        gearInfo\n        racingColorFileName\n        allowance\n        trainerPreference\n        last6run\n        saddleClothNo\n        trumpCard\n        priority\n        finalPosition\n        deadHeat\n        winOdds\n        jockey {\n          code\n          name_en\n          name_ch\n        }\n        trainer {\n          code\n          name_en\n          name_ch\n        }\n      }\n    }\n    obSt: pmPools(oddsTypes: [WIN, PLA]) {\n      leg {\n        races\n      }\n      oddsType\n      comingleStatus\n    }\n    poolInvs: pmPools(\n      oddsTypes: [WIN, PLA, QIN, QPL, CWA, CWB, CWC, IWN, FCT, TCE, TRI, FF, QTT, DBL, TBL, DT, TT, SixUP]\n    ) {\n      id\n      leg {\n        number\n        races\n      }\n      status\n      sellStatus\n      oddsType\n      investment\n      mergedPoolId\n      lastUpdateTime\n    }\n    ...racingBlockFragment\n    pmPools(oddsTypes: []) {\n      id\n    }\n    jkcInstNo: foPools(oddsTypes: [JKC], filters: ["top"]) {\n      instNo\n    }\n    tncInstNo: foPools(oddsTypes: [TNC], filters: ["top"]) {\n      instNo\n    }\n  }\n}'
 
+RACING_QUERY = '\nquery racing($date: String, $venueCode: String, $oddsTypes: [OddsType], $raceNo: Int) {\n  raceMeetings(date: $date, venueCode: $venueCode) {\n    pmPools(oddsTypes: $oddsTypes, raceNo: $raceNo) {\n      id\n      status\n      sellStatus\n      oddsType\n      lastUpdateTime\n      guarantee\n      minTicketCost\n      name_en\n      name_ch\n      leg {\n        number\n        races\n      }\n      cWinSelections {\n        composite\n        name_ch\n        name_en\n        starters\n      }\n      oddsNodes {\n        combString\n        oddsValue\n        hotFavourite\n        oddsDropValue\n        bankerOdds {\n          combString\n          oddsValue\n        }\n      }\n    }\n  }\n}\n'
+
 VENUE_NAMES = {"ST": "沙田", "HV": "跑馬地"}
 def venue_label(v): return VENUE_NAMES.get(v, v)
 def _f(x):
@@ -89,6 +91,36 @@ def _gql(variables):
     raise last
 
 
+def _fetch_live_odds(date_str, venue):
+    """即場 WIN 賠率由 oddsNodes 攞（同 8501 一樣來源；HKJC 唔填 runner.winOdds）。
+    回傳 {race_no: {horse_no: win_odds}}。"""
+    try:
+        r = _SESSION.post(API, headers=HEADERS, json={
+            "operationName": "racing", "query": RACING_QUERY,
+            "variables": {"date": date_str, "venueCode": venue,
+                          "oddsTypes": ["WIN"], "raceNo": None}}, timeout=25)
+        r.raise_for_status()
+        j = r.json()
+    except Exception:
+        return {}
+    if j.get("errors"):
+        return {}
+    out = {}
+    for mt in (j.get("data") or {}).get("raceMeetings") or []:
+        for p in mt.get("pmPools") or []:
+            if p.get("oddsType") != "WIN":
+                continue
+            races = (p.get("leg") or {}).get("races") or []
+            for node in p.get("oddsNodes") or []:
+                comb = str(node.get("combString") or "")
+                od = _f(node.get("oddsValue"))
+                if comb.isdigit() and od == od and od > 0:
+                    hno = int(comb)
+                    for rno in races:
+                        out.setdefault(int(rno), {})[hno] = od
+    return out
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def list_meetings():
     """所有有賽事嘅 日期+場地（含海外）。"""
@@ -122,6 +154,7 @@ def fetch_cards(date_str, venue):
     if not mtgs:
         return pd.DataFrame(), {}, {}
     mt = mtgs[0]
+    odds_map = _fetch_live_odds(date_str, venue)   # 即場賠率由 oddsNodes 攞
     races_meta, win_pool = {}, {}
     for p in mt.get("poolInvs") or []:
         if p.get("oddsType") == "WIN":
@@ -161,7 +194,7 @@ def fetch_cards(date_str, venue):
                 "draw": _f(rn.get("barrierDrawNumber")),
                 "actual_weight": _f(rn.get("handicapWeight")),
                 "declared_horse_weight": _f(rn.get("currentWeight")),
-                "win_odds": _f(rn.get("winOdds")),
+                "win_odds": _f((odds_map.get(rno) or {}).get(int(no), rn.get("winOdds"))),
                 "finishing_position": np.nan, "finish_time_sec": np.nan, "lbw": np.nan})
     return pd.DataFrame(rows), races_meta, win_pool
 
