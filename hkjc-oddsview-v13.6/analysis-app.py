@@ -16,7 +16,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "8502-V1.2-ODDS-20261003"
+APP_VERSION = "8502-V1.3-UX-20261003"
 HKT = timezone(timedelta(hours=8))
 
 # ── 路徑：hkjc_quant（模型+數據+模組）──
@@ -713,11 +713,12 @@ function onRace(){ri=+document.getElementById('selRace').value;SS('ri',ri);apply
   ri=Math.min(parseInt(SS('ri')||'0',10)||0,((D.meetings[mi]||{races:[]}).races.length||1)-1);if(ri<0)ri=0;
   document.getElementById('selRace').value=ri;
   const bk=SS('bk');if(bk)document.getElementById('bankroll').value=bk;
+  const dt=SS('dt');if(dt)document.getElementById('dtotal').value=dt;
   applyRace();
   document.getElementById('bankroll').addEventListener('input',()=>render(window.lastList||rows));
   document.getElementById('bankroll').addEventListener('change',e=>{clampBox(e.target);SS('bk',e.target.value);render(window.lastList||rows);});
   document.getElementById('dtotal').addEventListener('input',renderDutch);
-  document.getElementById('dtotal').addEventListener('change',e=>{clampBox(e.target);renderDutch();});
+  document.getElementById('dtotal').addEventListener('change',e=>{clampBox(e.target);SS('dt',e.target.value);renderDutch();});
 })();
 </script>
 """
@@ -729,7 +730,15 @@ from streamlit_autorefresh import st_autorefresh  # noqa: E402
 
 st.markdown("""<style>#MainMenu,footer,header,[data-testid="stToolbar"]{visibility:hidden;}
 .stApp{background:#0b0e14!important;} .block-container{padding:0!important;max-width:100%!important;}
-[data-testid="stElementContainer"]{margin:0!important;}</style>""", unsafe_allow_html=True)
+[data-testid="stElementContainer"]{margin:0!important;}
+/* 防止每 60 秒刷新時成版變暗（stale overlay）*/
+[data-testid="stStatusWidget"]{display:none!important;}
+.stApp [data-testid="stAppViewContainer"] *{animation:none!important;}
+.element-container,.stMarkdown{transition:none!important;animation:none!important;}
+[data-testid="stAppViewBlockContainer"]{opacity:1!important;}
+.stApp>div[data-stale="true"]{opacity:1!important;filter:none!important;}
+[data-stale="true"]{opacity:1!important;filter:none!important;}
+iframe{opacity:1!important;}</style>""", unsafe_allow_html=True)
 
 st_autorefresh(interval=60000, key="a60")
 
