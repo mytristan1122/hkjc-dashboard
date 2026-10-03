@@ -16,7 +16,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "8502-V1-20261002"
+APP_VERSION = "8502-V1.1-LOCAL-20261003"
 HKT = timezone(timedelta(hours=8))
 
 # ── 路徑：hkjc_quant（模型+數據+模組）──
@@ -433,7 +433,12 @@ def build_meeting(date_str, venue):
 
 def build_data(meetings):
     out, errs = [], []
-    for mtg in meetings[:4]:   # 最多 4 個賽馬日，控制成本
+    # 只分析本地賽（沙田 ST / 跑馬地 HV）：模型只有本地歷史，海外場（S1/S2…）分析唔到，
+    # 而且 list_meetings 按 (date,venue) 排，海外場會排喺沙田前面，舊有 meetings[:4]
+    # 會把沙田切走。改成先揀本地場，沙田/跑馬地一定入到；冇本地場先退而顯示海外，避免空白。
+    _local = [m for m in meetings if m.get("venue") in ("ST", "HV")]
+    _pool = _local if _local else meetings
+    for mtg in _pool[:4]:   # 最多 4 個本地賽馬日，控制成本
         try:
             md = build_meeting(mtg["date"], mtg["venue"])
             if md and md["races"]:
