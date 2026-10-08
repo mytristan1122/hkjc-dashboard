@@ -92,24 +92,26 @@ def _gql(variables):
 
 
 def _fetch_live_odds(date_str, venue):
-    """即場 WIN 賠率由 oddsNodes 攞（同 8501 一樣來源；HKJC 唔填 runner.winOdds）。
-    回傳 {race_no: {horse_no: win_odds}}。"""
+    """即場 WIN + PLA 賠率由 oddsNodes 攞（同 8501 一樣來源；HKJC 唔填 runner.winOdds）。
+    回傳 (win_map, place_map)，各為 {race_no: {horse_no: odds}}。"""
+    win, place = {}, {}
     try:
         r = _SESSION.post(API, headers=HEADERS, json={
             "operationName": "racing", "query": RACING_QUERY,
             "variables": {"date": date_str, "venueCode": venue,
-                          "oddsTypes": ["WIN"], "raceNo": None}}, timeout=25)
+                          "oddsTypes": ["WIN", "PLA"], "raceNo": None}}, timeout=25)
         r.raise_for_status()
         j = r.json()
     except Exception:
-        return {}
+        return {}, {}
     if j.get("errors"):
-        return {}
-    out = {}
+        return {}, {}
     for mt in (j.get("data") or {}).get("raceMeetings") or []:
         for p in mt.get("pmPools") or []:
-            if p.get("oddsType") != "WIN":
+            ot = p.get("oddsType")
+            if ot not in ("WIN", "PLA"):
                 continue
+            target = win if ot == "WIN" else place
             races = (p.get("leg") or {}).get("races") or []
             for node in p.get("oddsNodes") or []:
                 comb = str(node.get("combString") or "")
@@ -117,8 +119,8 @@ def _fetch_live_odds(date_str, venue):
                 if comb.isdigit() and od == od and od > 0:
                     hno = int(comb)
                     for rno in races:
-                        out.setdefault(int(rno), {})[hno] = od
-    return out
+                        target.setdefault(int(rno), {})[hno] = od
+    return win, place
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -154,7 +156,7 @@ def fetch_cards(date_str, venue):
     if not mtgs:
         return pd.DataFrame(), {}, {}
     mt = mtgs[0]
-    odds_map = _fetch_live_odds(date_str, venue)   # 即場賠率由 oddsNodes 攞
+    odds_map, place_map = _fetch_live_odds(date_str, venue)   # 即場 WIN + PLA 賠率
     races_meta, win_pool = {}, {}
     for p in mt.get("poolInvs") or []:
         if p.get("oddsType") == "WIN":
@@ -195,6 +197,7 @@ def fetch_cards(date_str, venue):
                 "actual_weight": _f(rn.get("handicapWeight")),
                 "declared_horse_weight": _f(rn.get("currentWeight")),
                 "win_odds": _f((odds_map.get(rno) or {}).get(int(no), rn.get("winOdds"))),
+                "place_odds": _f((place_map.get(rno) or {}).get(int(no))),
                 "finishing_position": np.nan, "finish_time_sec": np.nan, "lbw": np.nan})
     return pd.DataFrame(rows), races_meta, win_pool
 
@@ -288,6 +291,79 @@ def fitness_labels(hist, horse_id, distance, going):
         ds = bd = h.iloc[0:0]
     gs, bg = h[h["going"].astype(str) == str(going)], hist[hist["going"].astype(str) == str(going)]
     return lab(ds, bd), lab(gs, bg)
+
+
+# ── 距離分類 / 最佳場地 / 慣場（純由 runs_clean 計，只做顯示，唔入模型）──
+def going_family(going, track=None):
+    """把 going 併成四大類：快地 / 好地 / 黏軟 / 泥地（全天候）。認唔到 → ''。"""
+    s = str(going or "").upper()
+    t = str(track or "").upper()
+    if "ALL WEATHER" in t or "AWT" in t or "WET" in s:
+        return "泥地"
+    if "GOOD TO FIRM" in s or s in ("FIRM", "FAST"):
+        return "快地"
+    if s == "GOOD":
+        return "好地"
+    if any(k in s for k in ("YIELD", "SOFT", "HEAVY")):
+        return "黏軟"
+    return ""
+
+
+def dist_category(hist, horse_id, distance):
+    """今日途程嘅適配：good/mid/bad（此途程±100m 夠場先評）、first（初跑此途程）、up（增程）。"""
+    try:
+        d = float(distance)
+    except (TypeError, ValueError):
+        return "mid"
+    h = hist[hist["horse_id"] == horse_id]
+    if h.empty:
+        return "first"
+    band = h[(h["distance"] - d).abs() <= DIST_BAND]
+    if len(band) >= FIT_MIN_RUNS:
+        rate = (band["finishing_position"] <= 3).mean()
+        base_df = hist[(hist["distance"] - d).abs() <= DIST_BAND]
+        base = (base_df["finishing_position"] <= 3).mean() if len(base_df) else 0.25
+        return "good" if rate >= base + FIT_MARGIN else ("bad" if rate <= base - FIT_MARGIN else "mid")
+    try:
+        maxd = float(h["distance"].max())
+    except (TypeError, ValueError):
+        return "first"
+    return "up" if d > maxd + 50 else "first"
+
+
+def best_going(hist, horse_id, min_runs=FIT_MIN_RUNS):
+    """呢匹馬最叻跑邊種地：按 going 家族嘅入三甲率最高者（要 ≥min_runs 場）。唔夠數 → ''。"""
+    h = hist[hist["horse_id"] == horse_id]
+    if h.empty:
+        return ""
+    agg = {}
+    for _, r in h.iterrows():
+        fam = going_family(r.get("going"), r.get("track"))
+        if not fam:
+            continue
+        a = agg.setdefault(fam, [0, 0])
+        a[0] += 1
+        a[1] += int(r.get("finishing_position") == r.get("finishing_position")
+                    and r.get("finishing_position") <= 3)
+    cand = [(fam, n, top3 / n) for fam, (n, top3) in agg.items() if n >= min_runs]
+    if not cand:
+        return ""
+    cand.sort(key=lambda x: (-x[2], -x[1]))   # 入三甲率高優先，同率則場多
+    return cand[0][0]
+
+
+def venue_pref(hist, horse_id, min_runs=FIT_MIN_RUNS):
+    """跑開邊個場：ST / HV / 均（兩場差唔多）。唔夠數 → ''。"""
+    h = hist[hist["horse_id"] == horse_id]
+    n_st = int((h["venue"] == "ST").sum())
+    n_hv = int((h["venue"] == "HV").sum())
+    tot = n_st + n_hv
+    if tot < min_runs:
+        return ""
+    hi, lo = max(n_st, n_hv), min(n_st, n_hv)
+    if hi >= lo * 1.5 and hi > lo:
+        return "ST" if n_st > n_hv else "HV"
+    return "均"
 
 
 def dominant_style(style, horse_id):
@@ -425,6 +501,10 @@ def build_meeting(date_str, venue):
         return None
     scored = score_day(cards.to_json(), model_src + str(bundle.get("trained_at")))
     _brows, blabel, bdone = today_bias(date_str, venue)
+    plo_map = {}
+    if "place_odds" in cards.columns:
+        for _, x in cards.iterrows():
+            plo_map[(int(x["race_no"]), int(x["horse_no"]))] = x.get("place_odds")
     races = []
     for rno in sorted(scored["race_no"].unique()):
         g = scored[scored["race_no"] == rno]
@@ -434,17 +514,23 @@ def build_meeting(date_str, venue):
         dlist, dbase = draw_lift(hist, dist)
         horses = []
         for _, r in g.iterrows():
-            dl, gl = fitness_labels(hist, r["horse_id"], dist, going)
             sname, _spct = dominant_style(style, r["horse_id"])
             od = r["win_odds"]; od = float(od) if (od == od and od > 0) else None
             draw_v = int(r["draw"]) if r["draw"] == r["draw"] else None
+            plo = plo_map.get((int(rno), int(r["horse_no"])))
+            plo = float(plo) if (plo is not None and plo == plo and plo > 0) else None
+            ppl = r["p_place"]
+            pev = (float(ppl) * plo) if (plo is not None and ppl == ppl) else None
             horses.append({
                 "no": int(r["horse_no"]), "nm": r["horse_name"], "draw": draw_v,
                 "pace": PACE_NUM.get(sname, 5),
-                "dist": FIT_CODE.get(dl, "unknown"), "going": FIT_CODE.get(gl, "unknown"),
-                "odds": _rnd(od, 2), "pm": _rnd(r["p_model"]), "pk": _rnd(r["p_public"]),
+                "dcat": dist_category(hist, r["horse_id"], dist),
+                "bg": best_going(hist, r["horse_id"]),
+                "vn": venue_pref(hist, r["horse_id"]),
+                "odds": _rnd(od, 2), "plodds": _rnd(plo, 2),
                 "pf": _rnd(r["p_final"]), "pl": _rnd(r["p_place"]),
-                "ev": (_rnd(r["ev"], 3) if od is not None else None)})
+                "ev": (_rnd(r["ev"], 3) if od is not None else None),
+                "pev": (_rnd(pev, 3) if pev is not None else None)})
         chips = [c for c in [m.get("cls"),
                              (f'場地：{m.get("going")}' if m.get("going") else None),
                              (f'跑道 {m.get("course")}' if m.get("course") else None),
@@ -455,6 +541,7 @@ def build_meeting(date_str, venue):
         races.append({
             "no": int(rno), "title": f"第 {int(rno)} 場 · {dm}", "chips": chips,
             "bias": blabel if bdone else "樣本不足", "bias_sub": bias_sub,
+            "bgday": going_family(going, m.get("track")), "vnday": venue,
             "dist": int(dist) if (dist == dist and dist) else None,
             "pbase": round(pbase, 4), "dbase": round(dbase, 4),
             "pace": [[n, round(rt, 4), round(lf, 3)] for n, rt, lf in plist],
@@ -510,8 +597,20 @@ font-size:13px;font-weight:600;border-radius:6px;padding:3px 6px;cursor:pointer;
 font-family:var(--mono);font-size:13px;font-weight:600;padding:3px 8px;width:92px;outline:none}
 .binput:focus{box-shadow:0 0 0 2px rgba(80,170,255,.25)}
 .pick{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;vertical-align:middle}
-#dutchout .drow{display:flex;justify-content:space-between;gap:12px;font-size:12px;padding:4px 2px;border-bottom:1px solid rgba(34,43,58,.45)}
-#dutchout .dsum{margin-top:10px;font-size:12px;line-height:1.75}
+.poolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.pooltog{display:inline-flex;align-items:center;gap:6px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:5px 11px;font-size:12.5px;cursor:pointer;user-select:none}
+.pooltog.on{border-color:var(--accent);background:rgba(80,170,255,.12);color:var(--accent);font-weight:600}
+.pooltog.on.win{border-color:var(--gold);background:rgba(224,168,60,.14);color:var(--gold)}
+.dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.dcard{background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:11px 12px}
+.dcard.win{border-top:2px solid var(--gold)} .dcard.pla{border-top:2px solid var(--accent)}
+.dcard h4{font-size:12.5px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.dcard h4 .dt{width:72px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:3px 6px;font-family:var(--mono);font-size:12px}
+.drow{display:flex;justify-content:space-between;gap:10px;font-size:12px;padding:3px 0;border-bottom:1px solid rgba(34,43,58,.45)}
+.dsum{margin-top:8px;font-size:11.5px;line-height:1.7;color:var(--subtext)} .dsum b{color:var(--text)}
+.dhint{font-size:11.5px;color:var(--muted)}
+.help{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:9px;padding:9px 13px;margin-top:10px;font-size:11.5px;color:var(--subtext);line-height:1.85}
+.help b{color:var(--text)} .help .dc,.help .bgo,.help .vn{padding:0 5px;border-radius:4px}
 .racehdr{margin-top:12px;padding:11px 14px;background:var(--card);border:1px solid var(--border);border-radius:10px}
 .racehdr .line1{font-size:15px;font-weight:600}
 .racehdr .line2{font-size:12px;color:var(--subtext);margin-top:3px;display:flex;gap:7px;flex-wrap:wrap}
@@ -528,7 +627,8 @@ font-family:var(--mono);font-size:13px;font-weight:600;padding:3px 8px;width:92p
 .tbltop{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:9px}
 .tbltitle{font-size:13px;font-weight:600} .sorthint{font-size:11px;color:var(--muted)}
 .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
-table{border-collapse:collapse;width:100%;min-width:1240px}
+table{border-collapse:collapse;width:100%}
+thead th,tbody td{padding-left:5px;padding-right:5px}
 thead th{position:sticky;top:0;background:var(--card);text-align:right;font-size:9px;font-weight:600;
 letter-spacing:.03em;color:var(--muted);padding:6px 8px;border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none}
 thead th:hover{color:var(--subtext)} thead th.active{color:var(--accent)}
@@ -545,6 +645,14 @@ tbody tr.ev-pos td{background:rgba(46,203,119,.07)} tbody tr.ev-pos:hover td{bac
 .pace.p3{color:#9aa7b8;background:rgba(154,167,184,.12)} .pace.p4{color:#8ab4ff;background:rgba(80,170,255,.12)}
 .pace.p5{color:var(--muted);background:rgba(91,102,117,.12)}
 .fit{font-family:var(--sans);font-size:11px} .fit.good{color:var(--good)} .fit.mid{color:var(--subtext)} .fit.bad{color:#ff6b6b}
+.dc{font-family:var(--sans);font-size:11px;border-radius:5px;padding:1px 6px}
+.dc.good{color:var(--good);background:rgba(46,203,119,.12)} .dc.mid{color:var(--subtext);background:rgba(154,167,184,.10)}
+.dc.bad{color:#ff6b6b;background:rgba(255,107,107,.12)} .dc.first{color:#8ab4ff;background:rgba(80,170,255,.12)}
+.dc.up{color:var(--gold);background:rgba(224,168,60,.14)}
+.bgo{font-family:var(--sans);font-size:11px;color:var(--subtext)} .bgo.match{color:var(--good);font-weight:600}
+.vn{font-family:var(--mono);font-size:10.5px;border-radius:4px;padding:1px 5px;background:var(--surface);border:1px solid var(--border);color:var(--subtext)}
+.vn.match{color:var(--good);border-color:rgba(46,203,119,.4);font-weight:700}
+.plo{color:#8ab4ff} .pev{font-weight:700} .pev.pos{color:var(--good)} .pev.neg{color:var(--muted)}
 .ev{font-weight:700} .ev.pos{color:var(--good)} .ev.neg{color:var(--muted)}
 .ret.pos{color:var(--good)} .ret.neg{color:#8a94a3}
 .stake{color:var(--gold);font-weight:600;font-family:var(--mono)} .payout{color:var(--subtext);font-family:var(--mono)}
@@ -565,9 +673,12 @@ tbody tr.ev-pos td{background:rgba(46,203,119,.07)} tbody tr.ev-pos:hover td{bac
     <div class="ctl"><label>場地</label><span class="v" id="venueLbl"></span></div>
     <div class="ctl"><label>場次</label><select id="selRace" class="vsel" onchange="onRace()"></select></div>
     <div class="ctl"><label>EV 回扣</label><span class="v">獨贏 10%</span></div>
-    <div class="ctl"><label>單場本金 (HK$100–10000)</label><input id="bankroll" class="binput" type="number" value="1000" min="100" max="10000" step="100"></div>
     <div class="ctl"><label>刷新</label><span class="v">每 60 秒</span></div>
     <div class="ctl"><label>資料來源</label><span class="v">直連 HKJC</span></div>
+  </div>
+  <div class="help">
+    <b>距離</b>（今日途程 ±100m 往績）：<span class="dc good">佳</span> 跑得好　<span class="dc mid">一般</span> 普通　<span class="dc bad">不利</span> 跑得差　<span class="dc first">初跑</span> 未跑過呢個途程　<span class="dc up">增程</span> 今日比慣常<b>長</b><br>
+    <b>最佳場地</b>：呢匹馬<b>最叻跑邊種地</b>（快地/好地/黏軟/泥地）；今日地啱佢 → <span class="bgo match">綠色 ✓</span>。　<b>慣場</b>：跑開邊個馬場（<span class="vn">ST</span> 沙田 / <span class="vn">HV</span> 跑馬地 / 均）；今日場 = 佢慣場 → <span class="vn match">綠色</span>。
   </div>
   <div class="racehdr" id="racehdr"></div>
   <div class="factors" id="factors"></div>
@@ -580,19 +691,17 @@ tbody tr.ev-pos td{background:rgba(46,203,119,.07)} tbody tr.ev-pos:hover td{bac
       <th class="l" data-k="nm" data-t="txt" data-d="asc" onclick="sortCol(this)">馬名<span class="ind"></span></th>
       <th data-k="draw" data-t="num" data-d="asc" onclick="sortCol(this)">檔位<span class="ind"></span></th>
       <th class="l" data-k="pace" data-t="num" data-d="asc" onclick="sortCol(this)">歷史跑法<span class="ind"></span></th>
-      <th class="l" data-k="dist" data-t="rank" data-d="desc" onclick="sortCol(this)">距離<span class="ind"></span></th>
-      <th class="l" data-k="going" data-t="rank" data-d="desc" onclick="sortCol(this)">場地<span class="ind"></span></th>
+      <th class="l" data-k="dcat" data-t="rank" data-d="desc" onclick="sortCol(this)">距離<span class="ind"></span></th>
+      <th class="l" data-k="bg" data-t="txt" data-d="asc" onclick="sortCol(this)">最佳場地<span class="ind"></span></th>
+      <th data-k="vn" data-t="txt" data-d="asc" onclick="sortCol(this)">慣場<span class="ind"></span></th>
       <th data-k="odds" data-t="num" data-d="asc" onclick="sortCol(this)">即場賠率<span class="ind"></span></th>
-      <th data-k="pm" data-t="num" data-d="desc" onclick="sortCol(this)">基本面勝率<span class="ind"></span></th>
-      <th data-k="pk" data-t="num" data-d="desc" onclick="sortCol(this)">市場勝率<span class="ind"></span></th>
+      <th data-k="plodds" data-t="num" data-d="asc" onclick="sortCol(this)">位置賠率<span class="ind"></span></th>
       <th data-k="pf" data-t="num" data-d="desc" onclick="sortCol(this)">綜合勝率<span class="ind"></span></th>
       <th data-k="pl" data-t="num" data-d="desc" onclick="sortCol(this)">位置概率<span class="ind"></span></th>
       <th data-k="fair" data-t="num" data-d="asc" onclick="sortCol(this)">Fair<span class="ind"></span></th>
       <th id="thEV" data-k="ev" data-t="num" data-d="desc" onclick="sortCol(this)">EV<span class="ind"></span></th>
+      <th data-k="pev" data-t="num" data-d="desc" onclick="sortCol(this)">位置EV<span class="ind"></span></th>
       <th data-k="ret" data-t="num" data-d="desc" onclick="sortCol(this)">預期回報<span class="ind"></span></th>
-      <th data-k="stake" data-t="num" data-d="desc" onclick="sortCol(this)">建議注碼<span class="ind"></span></th>
-      <th data-k="payout" data-t="num" data-d="desc" onclick="sortCol(this)">若中派彩<span class="ind"></span></th>
-      <th data-k="netwin" data-t="num" data-d="desc" onclick="sortCol(this)">派彩減本金<span class="ind"></span></th>
     </tr></thead><tbody id="tb"></tbody></table></div>
     <div class="legend">
       <span><span class="dot" style="background:rgba(46,203,119,.5)"></span>EV &gt; 1.0（有價值，綠底）</span>
@@ -600,59 +709,63 @@ tbody tr.ev-pos td{background:rgba(46,203,119,.07)} tbody tr.ev-pos:hover td{bac
     </div>
   </div>
   <div class="tblwrap">
-    <div class="tbltop"><div class="tbltitle">🎯 Dutching 大細注 · 中任何一匹派彩都一樣</div>
-      <div class="sorthint">喺上表左邊「選」格剔要覆蓋嘅馬　·　總注 HK$ <input id="dtotal" class="binput" style="width:86px" type="number" value="1000" min="100" max="10000" step="100"> <span style="color:var(--muted)">($100–10000)</span></div></div>
-    <div id="dutchout"></div>
+    <div class="tbltop"><div class="tbltitle">🎯 Dutching 大細注 · 獨贏／位置 雙池（獨立計）</div>
+      <div class="sorthint">喺上表左邊「選」剔 2 匹或以上；下面逐池計大細注（中任何一匹派彩一樣）</div></div>
+    <div class="poolbar"><span class="dhint">計邊個池：</span>
+      <span class="pooltog win on" id="togWin" onclick="togPool('win')">☑ 獨贏池</span>
+      <span class="pooltog on" id="togPla" onclick="togPool('pla')">☑ 位置池</span></div>
+    <div class="dgrid" id="dgrid"></div>
   </div>
   <div class="foot">
-    <b>點睇：</b>綜合勝率＝基本面勝率（跑法／檔位／距離／場地 等因子）與 市場勝率（即場賠率反推）結合。
-    EV＝綜合勝率 × 即場賠率；EV &gt; 1 代表有潛在價值。預期回報＝EV − 1。<br>
-    <b>建議注碼：</b>1/4 凱利（按「本金」計），只對 EV &gt; 1 嘅馬顯示。<b>若中派彩＝</b>注碼 × 賠率；<b>派彩減本金＝</b>中咗淨賺。<br>
+    <b>點睇：</b>綜合勝率＝模型（跑法／檔位／距離／場館 等因子）撈市場勝率（即場賠率反推）。
+    EV＝綜合勝率 × 即場賠率；<b>位置EV</b>＝位置概率 × live 位置賠率（指示性，位置派彩賽前係估計）。EV/位置EV &gt; 1 = 潛在值博。預期回報＝EV − 1。<br>
+    <b>距離／最佳場地／慣場</b> 係由歷史往績計嘅參考標籤（<b>只顯示、唔改模型數值</b>；模型內部已含距離同場館因子）。<br>
+    <b>Dutching：</b>剔馬後逐池計，令中任何一匹派彩一樣；淨賺 <span style="color:var(--good)">綠＝有得賺</span>／<span style="color:#ff6b6b">紅＝保證蝕</span>（打和門檻 &gt; 100% = 包蝕）。<br>
     <b>提醒：</b>綜合勝率/EV 係模型估算，<b>唔等於保證結果</b>；模型 edge 統計上未顯著。賠率「—」代表該場未開賣。
   </div>
 </div>
 <script>
 const D = window.__DATA__ || {meetings:[]};
 const paceName={1:"放頭",2:"前置",3:"中置",4:"後置",5:"不詳"};
-const fitName={good:["佳","good"],mid:["一般","mid"],bad:["不利","bad"],unknown:["不詳","mid"]};
-const rankMap={good:3,mid:2,bad:1,unknown:0};
+const dcName={good:["佳","good"],mid:["一般","mid"],bad:["不利","bad"],first:["初跑","first"],up:["增程","up"]};
+const dcRank={good:5,mid:3,up:2,first:1,bad:0};
 const AMT_MIN=100,AMT_MAX=10000;
 let rows=[],picked=new Set(),curEl=null,mi=0,ri=0;
+let pools={win:true,pla:true};const POOLTOT={win:1000,pla:1000};
 function SS(k,v){try{if(v===undefined)return sessionStorage.getItem(k);sessionStorage.setItem(k,v);}catch(e){return null;}}
-function bankroll(){const v=parseFloat((document.getElementById('bankroll')||{}).value);return (isFinite(v)&&v>0)?Math.min(AMT_MAX,v):0;}
-function clampBox(el){let v=parseFloat(el.value);if(!isFinite(v)){el.value=AMT_MIN;return;}el.value=Math.min(AMT_MAX,Math.max(AMT_MIN,Math.round(v)));}
-function kfrac(r){if(r.odds==null||r.odds<=1)return 0;const e=r.pf*r.odds-1;return e<=0?0:(e/(r.odds-1))*0.25;}
-function stakeOf(r){return (r.odds==null||r.ev==null)?0:Math.round(bankroll()*kfrac(r));}
+function clampT(v){v=parseInt(v)||0;return Math.min(AMT_MAX,Math.max(AMT_MIN,v));}
 function pct(x){return x==null?'—':(x*100).toFixed(1)+'%';}
 function drawCls(d){return d<=4?"inside":(d>=10?"outside":"");}
 function render(list){
   window.lastList=list;
+  const rc=((D.meetings[mi]||{races:[]}).races[ri])||{};
+  const bgday=rc.bgday||"",vnday=rc.vnday||"";
+  const dash='<span style="color:var(--muted)">—</span>';
   document.getElementById('tb').innerHTML=list.map(r=>{
-    const evN=r.ev==null,pos=!evN&&r.ev>=1.0,s=stakeOf(r);
-    const fd=fitName[r.dist]||["—","mid"],fg=fitName[r.going]||["—","mid"];
-    const od=r.odds,odS=od==null?'—':od.toFixed(1),dash='<span style="color:var(--muted)">—</span>';
+    const evN=r.ev==null,pos=!evN&&r.ev>=1.0, pevN=r.pev==null,ppos=!pevN&&r.pev>=1.0;
+    const od=r.odds,odS=od==null?'—':od.toFixed(1), plo=r.plodds,ploS=plo==null?'—':plo.toFixed(1);
+    const dc=dcName[r.dcat]||["—","mid"], bgM=r.bg&&r.bg===bgday, vnM=r.vn&&r.vn===vnday;
     return '<tr class="'+(pos?'ev-pos':'')+'">'
-      +'<td class="l" style="text-align:center"><input type="checkbox" class="pick" '+(picked.has(r.no)?'checked':'')+(od==null?' disabled':'')+' onchange="togglePick('+r.no+',this.checked)"></td>'
+      +'<td class="l" style="text-align:center"><input type="checkbox" class="pick" '+(picked.has(r.no)?'checked':'')+((od==null&&plo==null)?' disabled':'')+' onchange="togglePick('+r.no+',this.checked)"></td>'
       +'<td class="l no">'+r.no+'</td><td class="l nm">'+r.nm+'</td>'
       +'<td><span class="draw '+(r.draw!=null?drawCls(r.draw):'')+'">'+(r.draw!=null?r.draw:'—')+'</span></td>'
       +'<td class="l"><span class="pace p'+r.pace+'">'+paceName[r.pace]+'</span></td>'
-      +'<td class="l"><span class="fit '+fd[1]+'">'+fd[0]+'</span></td>'
-      +'<td class="l"><span class="fit '+fg[1]+'">'+fg[0]+'</span></td>'
-      +'<td>'+odS+'</td><td>'+pct(r.pm)+'</td><td>'+pct(r.pk)+'</td><td>'+pct(r.pf)+'</td>'
-      +'<td style="color:var(--accent)">'+pct(r.pl)+'</td>'
+      +'<td class="l"><span class="dc '+dc[1]+'">'+dc[0]+'</span></td>'
+      +'<td class="l">'+(r.bg?'<span class="bgo'+(bgM?' match':'')+'">'+r.bg+(bgM?' ✓':'')+'</span>':dash)+'</td>'
+      +'<td>'+(r.vn?'<span class="vn'+(vnM?' match':'')+'">'+r.vn+'</span>':dash)+'</td>'
+      +'<td>'+odS+'</td><td class="plo">'+ploS+'</td>'
+      +'<td>'+pct(r.pf)+'</td><td style="color:var(--accent)">'+pct(r.pl)+'</td>'
       +'<td>'+(r.pf>0?(1/r.pf).toFixed(2):'—')+'</td>'
       +'<td class="ev '+(pos?'pos':'neg')+'">'+(evN?'—':r.ev.toFixed(2))+'</td>'
-      +'<td class="ret '+(pos?'pos':'neg')+'">'+(evN?'—':((r.ev>=1?'+':'')+((r.ev-1)*100).toFixed(0)+'%'))+'</td>'
-      +'<td class="stake">'+(s>0?'$'+s:dash)+'</td>'
-      +'<td class="payout">'+(s>0?'$'+Math.round(s*od):dash)+'</td>'
-      +'<td class="ret '+(s>0?'pos':'')+'">'+(s>0?'+$'+Math.round(s*(od-1)):dash)+'</td></tr>';
+      +'<td class="pev '+(ppos?'pos':'neg')+'">'+(pevN?'—':r.pev.toFixed(2))+'</td>'
+      +'<td class="ret '+(pos?'pos':'neg')+'">'+(evN?'—':((r.ev>=1?'+':'')+((r.ev-1)*100).toFixed(0)+'%'))+'</td></tr>';
   }).join('');
 }
 const acc={no:r=>r.no,nm:r=>r.nm,draw:r=>r.draw==null?-1:r.draw,pace:r=>r.pace,
-  dist:r=>rankMap[r.dist],going:r=>rankMap[r.going],odds:r=>r.odds==null?1e9:r.odds,
-  pm:r=>r.pm,pk:r=>r.pk==null?-1:r.pk,pf:r=>r.pf,pl:r=>r.pl,fair:r=>r.pf>0?1/r.pf:1e9,
-  ev:r=>r.ev==null?-1:r.ev,ret:r=>r.ev==null?-1:r.ev,stake:r=>stakeOf(r),
-  payout:r=>stakeOf(r)*(r.odds||0),netwin:r=>stakeOf(r)*((r.odds||0)-1)};
+  dcat:r=>dcRank[r.dcat]==null?-1:dcRank[r.dcat],bg:r=>r.bg||"",vn:r=>r.vn||"",
+  odds:r=>r.odds==null?1e9:r.odds,plodds:r=>r.plodds==null?1e9:r.plodds,
+  pf:r=>r.pf,pl:r=>r.pl,fair:r=>r.pf>0?1/r.pf:1e9,
+  ev:r=>r.ev==null?-1:r.ev,pev:r=>r.pev==null?-1:r.pev,ret:r=>r.ev==null?-1:r.ev};
 function sortCol(th){
   const k=th.dataset.k,t=th.dataset.t;
   let dir=(curEl===th)?(th.dataset.cur==='asc'?'desc':'asc'):th.dataset.d;
@@ -666,15 +779,26 @@ function sortCol(th){
   th.classList.add('active');th.querySelector('.ind').textContent=dir==='asc'?' ▲':' ▼';
 }
 function togglePick(no,on){on?picked.add(no):picked.delete(no);renderDutch();}
+function togPool(p){pools[p]=!pools[p];const el=document.getElementById(p==='win'?'togWin':'togPla');
+  el.classList.toggle('on',pools[p]);el.textContent=(pools[p]?'☑ ':'☐ ')+(p==='win'?'獨贏池':'位置池');SS('pool_'+p,pools[p]?'1':'0');renderDutch();}
+function setTot(kind,v){POOLTOT[kind]=clampT(v);SS('dt_'+kind,POOLTOT[kind]);renderDutch();}
+function dutchCard(kind,label,oddsKey,total){
+  const sel=rows.filter(r=>picked.has(r.no)&&r[oddsKey]!=null&&r[oddsKey]>0).sort((a,b)=>a[oddsKey]-b[oddsKey]);
+  if(sel.length<2) return '<div class="dcard '+kind+'"><h4><span>'+label+'</span></h4><div class="dhint">剔 2 匹或以上（有'+(kind==='win'?'獨贏':'位置')+'賠率）先計。</div></div>';
+  const inv=sel.reduce((a,r)=>a+1/r[oddsKey],0),K=total/inv,net=K-total,
+        cover=sel.reduce((a,r)=>a+((kind==='win'?r.pf:r.pl)||0),0);
+  const rh=sel.map(r=>{const st=total*(1/r[oddsKey])/inv;
+    return '<div class="drow"><span>'+r.no+' '+r.nm+' <span style="color:var(--muted)">@'+r[oddsKey].toFixed(1)+'</span></span><span><b style="color:var(--gold)">$'+Math.round(st)+'</b> <span style="color:var(--muted)">('+(total?((st/total*100).toFixed(0)):0)+'%)</span></span></div>';}).join('');
+  const netCol=net>=0?'var(--good)':'#ff6b6b',netStr=(net>=0?'+$':'-$')+Math.abs(Math.round(net)).toLocaleString(),pctStr=(net>=0?'+':'')+((1/inv-1)*100).toFixed(0)+'%';
+  return '<div class="dcard '+kind+'"><h4><span>'+label+'</span><span style="font-size:11px;color:var(--muted)">總注 $<input class="dt" type="number" value="'+total+'" min="100" max="10000" step="100" onchange="setTot(\''+kind+'\',this.value)"></span></h4>'
+    +rh+'<div class="dsum">保證派彩（中任何一匹入'+(kind==='win'?'頭馬':'位')+'）：<b style="color:var(--good)">$'+Math.round(K).toLocaleString()+'</b>　淨賺 <b style="color:'+netCol+'">'+netStr+'</b>（'+pctStr+'）<br>打和門檻：合計真實'+(kind==='win'?'勝':'入位')+'率需 &gt; <b>'+(inv*100).toFixed(1)+'%</b>　｜　模型合計 = <b style="color:'+(cover>inv?'var(--good)':'#ff6b6b')+'">'+(cover*100).toFixed(1)+'%</b></div></div>';
+}
 function renderDutch(){
-  const out=document.getElementById('dutchout');
-  const sel=rows.filter(r=>picked.has(r.no)&&r.odds!=null).sort((a,b)=>a.odds-b.odds);
-  if(sel.length<2){out.innerHTML='<div style="color:var(--muted);font-size:12px">喺上表剔選 2 匹或以上（有賠率）嘅馬，就會計大細注。</div>';return;}
-  const T=Math.min(AMT_MAX,Math.max(0,parseFloat(document.getElementById('dtotal').value)||0));
-  const invsum=sel.reduce((a,r)=>a+1/r.odds,0),mult=1/invsum,K=T*mult,cover=sel.reduce((a,r)=>a+r.pf,0),val=cover>invsum;
-  const rh=sel.map(r=>{const st=T*(1/r.odds)/invsum;
-    return '<div class="drow"><span>'+r.no+' '+r.nm+' <span style="color:var(--muted)">@'+r.odds.toFixed(1)+'</span></span><span><b style="color:var(--gold)">$'+Math.round(st)+'</b> <span style="color:var(--muted)">('+(T?((st/T*100).toFixed(1)):0)+'%)</span></span></div>';}).join('');
-  out.innerHTML=rh+'<div class="dsum">保證派彩（中任何一匹）：<b style="color:var(--good)">$'+Math.round(K).toLocaleString()+'</b>　淨賺 <b style="color:var(--good)">+$'+Math.round(K-T).toLocaleString()+'</b>（+'+((mult-1)*100).toFixed(1)+'%）<br>打和門檻：呢 '+sel.length+' 匹合計真實勝率需 &gt; <b>'+(invsum*100).toFixed(1)+'%</b>　｜　模型綜合勝率合計 = <b style="color:'+(val?'var(--good)':'#ff6b6b')+'">'+(cover*100).toFixed(1)+'%</b> → '+(val?'模型覺得值博 ✓':'模型覺得唔值博 ✗')+'<br><span style="color:var(--muted)">⚠️ 若 '+sel.length+' 匹全部跑唔出 → 全輸 $'+Math.round(T).toLocaleString()+'。Dutching 唔變出 edge；模型 edge 未統計顯著。</span></div>';
+  let html='';
+  if(pools.win) html+=dutchCard('win','獨贏池 Dutching','odds',POOLTOT.win);
+  if(pools.pla) html+=dutchCard('pla','位置池 Dutching','plodds',POOLTOT.pla);
+  if(!pools.win&&!pools.pla) html='<div class="dhint">揀返至少一個池（獨贏／位置）。</div>';
+  document.getElementById('dgrid').innerHTML=html;
 }
 function lhtml(arr){return (arr&&arr.length)?arr.map(a=>{const n=a[0],rate=a[1],lift=a[2];
   const c=lift>=1.08?'up':(lift<=0.92?'dn':'mid'),ar=lift>=1.08?' ↑':(lift<=0.92?' ↓':'');
@@ -712,13 +836,9 @@ function onRace(){ri=+document.getElementById('selRace').value;SS('ri',ri);apply
   document.getElementById('selMeet').value=mi;fillRaces();
   ri=Math.min(parseInt(SS('ri')||'0',10)||0,((D.meetings[mi]||{races:[]}).races.length||1)-1);if(ri<0)ri=0;
   document.getElementById('selRace').value=ri;
-  const bk=SS('bk');if(bk)document.getElementById('bankroll').value=bk;
-  const dt=SS('dt');if(dt)document.getElementById('dtotal').value=dt;
+  ['win','pla'].forEach(p=>{const s=SS('pool_'+p);if(s!=null)pools[p]=(s==='1');const t=SS('dt_'+p);if(t)POOLTOT[p]=clampT(t);
+    const el=document.getElementById(p==='win'?'togWin':'togPla');el.classList.toggle('on',pools[p]);el.textContent=(pools[p]?'☑ ':'☐ ')+(p==='win'?'獨贏池':'位置池');});
   applyRace();
-  document.getElementById('bankroll').addEventListener('input',()=>render(window.lastList||rows));
-  document.getElementById('bankroll').addEventListener('change',e=>{clampBox(e.target);SS('bk',e.target.value);render(window.lastList||rows);});
-  document.getElementById('dtotal').addEventListener('input',renderDutch);
-  document.getElementById('dtotal').addEventListener('change',e=>{clampBox(e.target);SS('dt',e.target.value);renderDutch();});
 })();
 </script>
 """
