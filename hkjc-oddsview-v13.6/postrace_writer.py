@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-postrace_writer.py  —  獨立補寫 postrace.json（唔郁 recorder）  [V2 · lxml parser]
+postrace_writer.py  —  獨立補寫 postrace.json（唔郁 recorder）  [V3 · lxml parser + 防 stale 賽果頁]
 
 8502「今日場地偏差」要讀 recorder 寫嘅 postrace.json。VPS 跑緊舊 recorder 冇寫，
 而新 recorder 原本嗰段 `requests + pd.read_html` 喺而家 HKJC 賽果頁解析唔到
@@ -12,6 +12,8 @@ postrace_writer.py  —  獨立補寫 postrace.json（唔郁 recorder）  [V2 ·
 
 - 只會：GET HKJC 本地賽果頁（公開）＋ 寫 <DATA_DIR>/<date>__<venue>__<no>/postrace.json
 - 唔會：掂 recorder 程式、唔會改任何現有 snapshot 檔
+- V3 防 stale：HKJC 對「未出賽果」嘅日期會回最近一次賽事嘅賽果頁；
+  寫檔前核對頁面「Race Meeting」日期 == 要求日期，對唔上或者讀唔到就唔寫（寧缺勿錯）
 - 冪等：已 completed 嘅場會跳過；只處理香港本地場 ST / HV（海外 S1/S4… 自動略過）
 
 用法：
@@ -84,6 +86,16 @@ def fetch_postrace_runs(date_str, venue, race_no):
     r = requests.get(RESULTS_URL, params=params, headers=RESULTS_HEADERS, timeout=25)
     r.raise_for_status()
     doc = lxml.html.fromstring(r.text)
+
+    # V3：核對頁面賽事日期（防 HKJC 回舊賽果）
+    page_txt = re.sub(r'\s+', ' ', doc.text_content())
+    want = datetime.strptime(str(date_str), '%Y-%m-%d').strftime('%d/%m/%Y')
+    m = re.search(r'Race\s*Meeting\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})', page_txt, re.I)
+    if not m:
+        raise RuntimeError('賽果頁讀唔到賽事日期（Race Meeting），為安全唔寫')
+    got = datetime.strptime(m.group(1), '%d/%m/%Y').strftime('%d/%m/%Y')
+    if got != want:
+        raise RuntimeError(f'賽果頁日期 {got} ≠ 要求 {want}（HKJC 回咗舊賽果／賽果未出）')
 
     target = None
     for tb in doc.xpath('//table'):
