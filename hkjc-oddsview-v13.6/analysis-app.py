@@ -16,7 +16,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "8502-V1.3-UX-20261003"
+APP_VERSION = "8502-V1.4-UX-20261011"
 HKT = timezone(timedelta(hours=8))
 
 # ── 路徑：hkjc_quant（模型+數據+模組）──
@@ -402,9 +402,31 @@ def dutching(odds_list):
     return {"pct": [(1.0 / o) / inv for o in odds], "mult": 1.0 / inv, "breakeven": inv}
 
 
-# ── 今日場地偏差（讀 recorder 寫嘅 postrace.json）──
-def today_bias(date_str, venue):
-    agg = {}; done = []
+# ── 今日場地偏差（讀 recorder / postrace_writer 寫嘅 postrace.json）──
+def _hid_key(h):
+    """horse_id 正規化：HK_2022_H087 → H087（兩邊格式唔同都對得上）。"""
+    h = str(h or "").strip().upper()
+    return h.rsplit("_", 1)[-1] if h else ""
+
+
+def _post_passed(post, now):
+    """開跑時間已過？讀唔到時間就當未過（寧缺勿錯）。"""
+    try:
+        t = datetime.fromisoformat(str(post).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=HKT)
+        return now >= t
+    except (TypeError, ValueError):
+        return False
+
+
+def today_bias(date_str, venue, card_ids=None, race_meta=None):
+    """card_ids: {race_no: set(今日排位表 horse_id)}；race_meta: {race_no: {"post":...}}。
+       V1.4 防 stale：①未到開跑時間嘅場一律唔計；②postrace 入面嘅馬同今日排位表
+       對唔上（<50% 重疊）＝ HKJC 回咗舊賽果頁 → 唔計，記入 stale。"""
+    card_ids = card_ids or {}; race_meta = race_meta or {}
+    now = datetime.now(HKT)
+    agg = {}; done = []; stale = []
     for d in glob.glob(os.path.join(DATA_DIR, f"{date_str}__{venue}__*")):
         pj = os.path.join(d, "postrace.json")
         if not os.path.exists(pj): continue
@@ -413,7 +435,19 @@ def today_bias(date_str, venue):
         except (OSError, ValueError):
             continue
         if not data.get("completed"): continue
-        done.append(data.get("race_meta", {}).get("race_no"))
+        rno = data.get("race_meta", {}).get("race_no")
+        try:
+            rno = int(rno)
+        except (TypeError, ValueError):
+            continue
+        m = race_meta.get(rno)
+        if m is not None and not _post_passed(m.get("post"), now):
+            stale.append(rno); continue
+        today = {_hid_key(h) for h in card_ids.get(rno, set())} - {""}
+        got = {_hid_key(r.get("horse_id")) for r in (data.get("runs") or [])} - {""}
+        if today and got and len(today & got) < 0.5 * min(len(today), len(got)):
+            stale.append(rno); continue
+        done.append(rno)
         for style, s in (data.get("style_stats") or {}).items():
             a = agg.setdefault(style, {"n": 0, "top3": 0})
             a["n"] += int(s.get("n", 0)); a["top3"] += int(s.get("top3", 0))
@@ -426,7 +460,7 @@ def today_bias(date_str, venue):
     rows.sort(key=lambda x: -x["lift"])
     reliable = [r for r in rows if r["reliable"]]
     bias = ("利「" + reliable[0]["style"] + "」") if reliable else "樣本不足"
-    return rows, bias, sorted([x for x in done if x])
+    return rows, bias, sorted(done), sorted(set(stale))
 
 
 def draw_lift(hist, dist, band=DIST_BAND):
@@ -500,7 +534,10 @@ def build_meeting(date_str, venue):
     if cards.empty:
         return None
     scored = score_day(cards.to_json(), model_src + str(bundle.get("trained_at")))
-    _brows, blabel, bdone = today_bias(date_str, venue)
+    _cids = {}
+    for _, x in cards.iterrows():
+        _cids.setdefault(int(x["race_no"]), set()).add(str(x["horse_id"]))
+    _brows, blabel, bdone, bstale = today_bias(date_str, venue, _cids, meta)
     plo_map = {}
     if "place_odds" in cards.columns:
         for _, x in cards.iterrows():
@@ -538,6 +575,8 @@ def build_meeting(date_str, venue):
         dm = f"{int(dist)}M" if (dist == dist and dist) else "?M"
         bias_sub = (f'已完成：{", ".join("第%d場" % n for n in bdone)}'
                     if bdone else "今日尚未有已完成場次；頭幾場完成後逐場更新。")
+        if bstale:
+            bias_sub += f'（已略過 {len(bstale)} 場未核實／未開跑嘅賽果）'
         races.append({
             "no": int(rno), "title": f"第 {int(rno)} 場 · {dm}", "chips": chips,
             "bias": blabel if bdone else "樣本不足", "bias_sub": bias_sub,
